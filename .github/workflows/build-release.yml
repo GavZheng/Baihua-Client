@@ -269,8 +269,12 @@ jobs:
         shell: bash
         run: |
           cargo install cargo-apk --locked
-          sdkmanager "ndk;27.2.12479018" > /dev/null
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          # The runner image ships an NDK already; install one only when none
+          # exists. sdkmanager lives under cmdline-tools, not on the PATH.
+          if ! ls "${ANDROID_HOME}/ndk" > /dev/null 2>&1; then
+            yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+              "ndk;27.2.12479018" > /dev/null
+          fi
 
       - name: Install the macOS disk image builder
         if: matrix.bundle_name != '' && matrix.package_kind == 'dmg'

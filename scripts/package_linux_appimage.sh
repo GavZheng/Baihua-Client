@@ -53,12 +53,14 @@ pack_type_two_by_hand() {
 }
 
 if [ -x "${LINUXDEPLOY}" ] && "${LINUXDEPLOY}" --appdir "${appdir}" --output appimage; then
-  for candidate in ${BUNDLE_NAME}-${TARGET}.AppImage ${appdir}.AppImage; do
-    if [ -f "$candidate" ]; then mv "$candidate" "${image}"; fi
+  # linuxdeploy names the output from the desktop entry plus the machine
+  # architecture, so adopt any produced image instead of guessing the name.
+  for candidate in ./*.AppImage; do
+    if [ -f "${candidate}" ]; then mv "${candidate}" "${image}"; fi
   done
-else
-  pack_type_two_by_hand
 fi
+# No image exists when linuxdeploy was unusable or produced nothing to adopt.
+[ -f "${image}" ] || pack_type_two_by_hand
 
 if command -v shasum >/dev/null 2>&1; then
   shasum -a 256 "${image}" > "${image}.sha256"

@@ -92,6 +92,7 @@ jobs:
 
           # Targets: five fields are triplet, runner, archive suffix,
           # executable suffix and the installer kind for that target.
+          target_specifications=(
             "aarch64-apple-darwin|macos-latest|tar.gz||dmg"
             "x86_64-apple-darwin|macos-latest|tar.gz||dmg"
             "x86_64-pc-windows-msvc|windows-latest|zip|.exe|msi"
@@ -102,6 +103,7 @@ jobs:
 
           # Ends: seven fields are product, package, tag prefix, package prefix,
           # binary, changelog and the bundle name an installer package uses.
+          product_specifications=(
             "cli|baihua-cli|cli-v|baihua-cli-|baihua|CHANGELOG_CLI.md"
             "gui|baihua-client-gui|gui-v|baihua-gui-|baihua-gui|CHANGELOG_GUI.md|Baihua"
             "tui|baihua-client-tui|tui-v|baihua-tui-|baihua-tui|CHANGELOG_TUI.md"
@@ -258,12 +260,12 @@ jobs:
 
       # -- Toolchains only installer kinds need (each cheap, each conditional) --
       - name: Install the Windows installer builder
-        if: matrix.package_kind == 'msi'
+        if: matrix.bundle_name != '' && matrix.package_kind == 'msi'
         shell: bash
         run: cargo install cargo-wix --version 0.3.9 --locked
 
       - name: Install the Android toolchain
-        if: matrix.package_kind == 'apk'
+        if: matrix.bundle_name != '' && matrix.package_kind == 'apk'
         shell: bash
         run: |
           cargo install cargo-apk --locked
@@ -271,7 +273,7 @@ jobs:
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install the macOS disk image builder
-        if: matrix.package_kind == 'dmg'
+        if: matrix.bundle_name != '' && matrix.package_kind == 'dmg'
         shell: bash
         run: |
           python3 -m venv "$HOME/dmgbuild-environment"
@@ -279,7 +281,7 @@ jobs:
           echo "DMGBUILD_PYTHON=$HOME/dmgbuild-environment/bin/python3" >> "$GITHUB_ENV"
 
       - name: Install the Linux AppImage builder
-        if: matrix.package_kind == 'appimage'
+        if: matrix.bundle_name != '' && matrix.package_kind == 'appimage'
         shell: bash
         run: |
           curl -fL -o "$HOME/linuxdeploy" \
@@ -309,11 +311,18 @@ jobs:
             ipa) scripts/build_packages.sh --end gui --platform ios ;;
           esac
 
+      # Installer scripts record the package as dist/<file>; the artifact name
+      # must be the bare file, so strip the directory in a step of its own.
+      - name: Record the installer package name
+        if: matrix.bundle_name != ''
+        shell: bash
+        run: echo "archive_name=${archive##*/}" >> "$GITHUB_ENV"
+
       # -- Upload the package and its digest -----------------------------------
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.archive }}
+          name: ${{ env.archive_name || env.archive }}
           path: |
             ${{ env.archive }}
             ${{ env.archive }}.sha256

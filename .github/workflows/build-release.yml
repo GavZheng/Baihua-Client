@@ -264,9 +264,21 @@ jobs:
         shell: bash
         run: cargo install cargo-wix --version 0.3.9 --locked
 
+      - name: Cache the Android debug keystore
+        if: matrix.bundle_name != '' && matrix.package_kind == 'apk'
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: baihua-android-debug-keystore
+
       - name: Install the Android toolchain
         if: matrix.bundle_name != '' && matrix.package_kind == 'apk'
         shell: bash
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.CARGO_APK_RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.CARGO_APK_RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.CARGO_APK_RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.CARGO_APK_RELEASE_KEY_PASSWORD }}
         run: |
           cargo install cargo-apk --locked
           # The runner image ships an NDK already; install one only when none
@@ -275,6 +287,27 @@ jobs:
             yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
               "ndk;27.2.12479018" > /dev/null
           fi
+
+          # Signing prefers a release keystore from the repository secrets; the
+          # debug fallback is cached across runs so releases can update each other.
+          if [ -n "${RELEASE_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "${RELEASE_KEYSTORE_BASE64}" | base64 --decode \
+              > "${RUNNER_TEMP}/baihua-release.keystore"
+            {
+              echo "CARGO_APK_RELEASE_KEYSTORE=${RUNNER_TEMP}/baihua-release.keystore"
+              echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=${RELEASE_KEYSTORE_PASSWORD}"
+              echo "CARGO_APK_RELEASE_KEY_ALIAS=${RELEASE_KEY_ALIAS}"
+              echo "CARGO_APK_RELEASE_KEY_PASSWORD=${RELEASE_KEY_PASSWORD}"
+            } >> "$GITHUB_ENV"
+          elif [ ! -f "${HOME}/.android/debug.keystore" ]; then
+            mkdir -p "${HOME}/.android"
+            keytool -genkeypair \
+              -keystore "${HOME}/.android/debug.keystore" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=Android Debug,O=Android,C=US'
+          fi
+          test -f "${HOME}/.android/debug.keystore" || [ -n "${RELEASE_KEYSTORE_BASE64:-}" ]
 
       - name: Install the macOS disk image builder
         if: matrix.bundle_name != '' && matrix.package_kind == 'dmg'

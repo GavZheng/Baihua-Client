@@ -62,20 +62,31 @@
                                 Name='baihua-gui.exe'
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\baihua-gui.exe'
-                                KeyPath='yes'>
-                                <Shortcut Id='StartMenuShortcut'
-                                    Name='Baihua'
-                                    Description='Baihua instant messenger'
-                                    Directory='ProgramMenuFolder'
-                                    Advertise='no'
-                                    Icon='ProductICO'/>
-                                <Shortcut Id='DesktopShortcut'
-                                    Name='Baihua'
-                                    Description='Baihua instant messenger'
-                                    Directory='DesktopFolder'
-                                    Advertise='no'
-                                    Icon='ProductICO'/>
-                            </File>
+                                KeyPath='yes'/>
+                        </Component>
+
+                        <!-- MSI validation (ICE43/ICE57) demands shortcuts live in a
+                             per-user component keyed by an HKCU registry value. -->
+                        <Component Id='ApplicationShortcut' Guid='*'>
+                            <Shortcut Id='StartMenuShortcut'
+                                Name='Baihua'
+                                Description='Baihua instant messenger'
+                                Directory='ProgramMenuFolder'
+                                Advertise='no'
+                                Target='[exe0]'
+                                Icon='ProductICO'/>
+                            <Shortcut Id='DesktopShortcut'
+                                Name='Baihua'
+                                Description='Baihua instant messenger'
+                                Directory='DesktopFolder'
+                                Advertise='no'
+                                Target='[exe0]'
+                                Icon='ProductICO'/>
+                            <RemoveFolder Id='RemoveProgramMenuFolder'
+                                Directory='ProgramMenuFolder' On='uninstall'/>
+                            <RegistryValue Root='HKCU'
+                                Key='Software\[Manufacturer]\[ProductName]'
+                                Name='shortcut' Type='integer' Value='1' KeyPath='yes'/>
                         </Component>
                     </Directory>
 
@@ -123,6 +134,7 @@
             Absent='disallow'>
             <ComponentRef Id='License'/>
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='ApplicationShortcut'/>
             <ComponentRef Id='LanguageEnglish'/>
             <ComponentRef Id='LanguageChinese'/>
             <ComponentRef Id='ThemeDefault'/>

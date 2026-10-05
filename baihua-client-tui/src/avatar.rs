@@ -219,6 +219,8 @@ mod tests {
         assert_eq!(placeholder_color("alice"), placeholder_color("alice"));
         assert_ne!(placeholder_color("alice"), placeholder_color("bob"));
         assert_eq!(placeholder_initial("alice"), "A");
+        // A Han name must keep its own initial (no uppercasing applies): the wide glyph
+        // itself is the measurement fixture here, not user-facing text
         assert_eq!(placeholder_initial("白露"), "白");
         assert_eq!(placeholder_initial(""), "?");
     }

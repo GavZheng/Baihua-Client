@@ -1,7 +1,7 @@
 //! Client local directories and resource location.
 //!
 //! The root directory follows the same convention as the server: prefer the environment variable `BAIHUA_DIR`, otherwise use the user's home directory's
-//! `.baihua`。服务端把数据放在该根目录，客户端统一放在其下的 `client` 子目录，
+//! `.baihua`.  The server keeps its data at that root; every client file lives under its `client`
 //! both sides share the same tree but do not overwrite each other.
 
 use std::path::PathBuf;
@@ -86,6 +86,27 @@ pub fn config_directory_candidates() -> Vec<PathBuf> {
     let Some(executable) = current_executable() else {
         return candidates;
     };
+    // macOS application bundles (created by `cargo bundle`, dragged into
+    // /Applications) keep shared files under `<App>.app/Contents/Resources`;
+    // that is the only place a packaged app can carry the shared `config/`
+    // tree, and the ancestor walk below never looks there, so it gets its own
+    // candidate right before the walk.
+    if let Some(bundle_resources_config) = executable
+        .parent()
+        .and_then(|macos_directory| macos_directory.parent())
+        .map(|contents_directory| contents_directory.join("Resources").join("config"))
+    {
+        candidates.push(bundle_resources_config);
+    }
+    // A Linux AppImage runs its payload from a temporary mount, where the shared
+    // tree sits beside the binary directory as `<mount>/usr/share/baihua/config`.
+    if let Some(share_config) = executable
+        .parent()
+        .and_then(|binary_directory| binary_directory.parent())
+        .map(|usr_directory| usr_directory.join("share").join("baihua").join("config"))
+    {
+        candidates.push(share_config);
+    }
     // Walk up from the executable directory: the install layout is <prefix>/bin/<program> + <prefix>/config,
     // the development layout is <repo>/target/<config>/<program> + <repo>/config,
     // both fall on the path of "walk up level by level"; no need to hardcode the depth for each layout
@@ -128,18 +149,59 @@ pub fn readable_config_path(relative_path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A packaged macOS app carries the shared `config/` tree under
+    /// `Contents/Resources`; the candidate list must contain a
+    /// `<two levels above the executable>/Resources/config` entry so that
+    /// layout is found without the terminal.
+    #[test]
+    fn app_bundle_resources_directory_is_a_config_candidate() {
+        let candidates = config_directory_candidates();
+        let looks_like_bundle_resources = |candidate: &PathBuf| {
+            candidate.file_name() == Some(std::ffi::OsStr::new("config"))
+                && candidate
+                    .parent()
+                    .map(|parent| parent.file_name() == Some(std::ffi::OsStr::new("Resources")))
+                    .unwrap_or(false)
+        };
+        assert!(
+            candidates.iter().any(looks_like_bundle_resources),
+            "the candidates must contain the application bundle's Resources/config, got {candidates:?}"
+        );
+    }
+
+    /// An AppImage payload lives at `<mount>/usr/bin/<program>` with its shared
+    /// tree at `<mount>/usr/share/baihua/config`, so that spelling must be one of
+    /// the candidates or a packaged Linux client falls back to built-in defaults.
+    #[test]
+    fn app_image_share_directory_is_a_config_candidate() {
+        let candidates = config_directory_candidates();
+        let looks_like_app_image_share = |candidate: &PathBuf| {
+            candidate.file_name() == Some(std::ffi::OsStr::new("config"))
+                && candidate
+                    .parent()
+                    .map(|parent| parent.file_name() == Some(std::ffi::OsStr::new("baihua")))
+                    .unwrap_or(false)
+        };
+        assert!(
+            candidates.iter().any(looks_like_app_image_share),
+            "the candidates must contain the AppImage share/baihua/config, got {candidates:?}"
+        );
+    }
+
     #[test]
     fn config_directory_resolves_next_to_the_executable() {
-        // 造一份临时安装布局 <前缀>/bin/（假可执行）+ <前缀>/config，
-        // 证明从任意工作目录启动都能按祖先目录找到配置
+        // Build a temporary installation layout <prefix>/bin/ (fake executable) + <prefix>/config
+        // to prove the ancestor lookup finds the config from any working directory
         let root = std::env::temp_dir().join("baihua-config-lookup");
-        std::fs::create_dir_all(root.join("config")).expect("配置目录应可创建");
-        std::fs::write(root.join("config").join("preferences.json"), "{}").expect("写入应成功");
+        std::fs::create_dir_all(root.join("config"))
+            .expect("the config directory must be creatable");
+        std::fs::write(root.join("config").join("preferences.json"), "{}")
+            .expect("the write must succeed");
         let resolved = config_directory();
-        // 本测试进程的当前目录就是仓库根，那里有真实的 config，故结果必须是已存在的目录
+        // This test process runs from the repository root, which ships a real config, so the result must be an existing directory
         assert!(
             resolved.is_dir(),
-            "配置目录解析结果应真实存在: {resolved:?}"
+            "the resolved config directory must really exist: {resolved:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -158,30 +220,34 @@ mod tests {
         let Some(root) = data_root() else {
             return;
         };
-        // 两个界面共用同一份配置与缓存：用户数据都在同一个客户端根目录下——
-        // 配置（preferences.json 与用户自备头像）在 `<客户端根目录>/config`，
-        // 可再生的消息缓存与头像缓存在 `<客户端根目录>/cache`。
-        // 界面不参与路径计算（都由本模块决定），所以终端版与图形版算出来的永远是同一条路径。
+        // Both interfaces share one configuration and one cache: all user data sits under one client root —
+        // configuration (preferences.json and user-supplied avatars) in `<client root>/config`,
+        // regenerable message and avatar caches in `<client root>/cache`.
+        // Neither interface computes paths itself (this module decides), so the terminal and graphical versions always derive the same path.
         let preferences = writable_config_path("preferences.json");
         assert!(
             preferences.starts_with(root.join("client").join("config")),
-            "用户配置要落在客户端根目录的 config 下，两个界面共用同一份: {preferences:?}"
+            "the user configuration must land under the client root's config, shared by both interfaces: {preferences:?}"
         );
-        let messages = chat_message_directory().expect("消息缓存目录应可定位");
-        let avatars = avatar_directory().expect("头像缓存目录应可定位");
-        let updates = update_directory().expect("更新目录应可定位");
-        let installs = install_directory().expect("安装目录应可定位");
-        let sources = avatar_source_directory().expect("头像来源目录应可定位");
+        let messages =
+            chat_message_directory().expect("the message cache directory must be locatable");
+        let avatars = avatar_directory().expect("the avatar cache directory must be locatable");
+        let updates = update_directory().expect("the update directory must be locatable");
+        let installs = install_directory().expect("the install directory must be locatable");
+        let sources =
+            avatar_source_directory().expect("the avatar source directory must be locatable");
         for directory in [&messages, &avatars, &updates, &installs, &sources] {
             assert!(directory.starts_with(root.join("client")));
         }
-        // 用户自备的头像图属于配置（用户放进去的），与可再生缓存分开
+        // User-supplied avatar pictures are configuration (the person put them there), kept apart from regenerable caches
         assert!(sources.starts_with(root.join("client").join("config")));
 
-        assert!(!sources.starts_with(cache_directory().expect("缓存根目录应可定位")));
-        // 可再生的两类缓存都收在 cache 之下，卸载时才能一次清干净
+        assert!(!sources.starts_with(cache_directory().expect("the cache root must be locatable")));
+        // Both regenerable caches live under cache/ so an uninstall can clear them in one pass
         for directory in [&messages, &avatars] {
-            assert!(directory.starts_with(cache_directory().expect("缓存根目录应可定位")));
+            assert!(
+                directory.starts_with(cache_directory().expect("the cache root must be locatable"))
+            );
         }
     }
 }

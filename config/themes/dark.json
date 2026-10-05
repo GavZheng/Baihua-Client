@@ -1,8 +1,8 @@
 {
-  "app_background": "#1e1f22",
-  "message_border": "#3f4147",
-  "room_border": "#3f4147",
-  "overlay_border": "#4a4d52",
+  "app_background": "#23272e",
+  "message_border": "#4b5563",
+  "room_border": "#4b5563",
+  "overlay_border": "#5b6b7d",
   "message_text": "#dbdee1",
   "selected_text": "#ffffff",
   "other_username_text": "#4fb3d9",
@@ -11,12 +11,13 @@
   "hint_text": "#87898c",
   "notice_hint_border": "#8a93f7",
   "notice_error_border": "#f23f43",
-  "input_border": "#5e6169",
+  "input_border": "#4b5563",
   "input_text": "#f2f3f5",
   "command_border": "#f0b232",
   "search_border": "#f23f43",
   "selection_background": "#4a6fa5",
   "search_match_background": "#7a5c1f",
   "search_current_match_background": "#f5c542",
-  "read_state_text": "#8a93f7"
+  "read_state_text": "#8a93f7",
+  "icon_color": "#b6c2cf"
 }

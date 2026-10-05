@@ -1,8 +1,8 @@
 {
-  "app_background": "default",
-  "message_border": "cyan",
-  "room_border": "cyan",
-  "overlay_border": "cyan",
+  "app_background": "#2b3038",
+  "message_border": "#5b6b7d",
+  "room_border": "#5b6b7d",
+  "overlay_border": "#6b7a8d",
   "message_text": "white",
   "selected_text": "yellow",
   "other_username_text": "cyan",
@@ -11,12 +11,13 @@
   "hint_text": "dark_gray",
   "notice_hint_border": "blue",
   "notice_error_border": "red",
-  "input_border": "cyan",
+  "input_border": "#5b6b7d",
   "input_text": "white",
   "command_border": "yellow",
   "search_border": "red",
   "selection_background": "yellow",
   "search_match_background": "red",
   "search_current_match_background": "light_yellow",
-  "read_state_text": "blue"
+  "read_state_text": "blue",
+  "icon_color": "#93a5b8"
 }

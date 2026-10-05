@@ -7,6 +7,6 @@
   "quick_search": false,
   "server_address": "http://localhost:2424",
   "show_uid": false,
-  "sound_enabled": true,
+  "sound_enabled": false,
   "time_with_date": true
 }

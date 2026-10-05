@@ -1,23 +1,23 @@
-# 三端各自独立发版：命令行版 `baihua`（cli-v<版本>）、图形版 `baihua-gui`（gui-v<版本>）、
-# 终端版 `baihua-tui`（tui-v<版本>）。三端进度不统一，所以版本号、标签、安装包各走各的，
-# 检查也各查各的：某一端只有在该版本的标签还不存在时才会构建并发布一次。
+# The three ends release independently: `baihua` (cli-v<version>), `baihua-gui`
+# (gui-v<version>) and `baihua-tui` (tui-v<version>). Versions, tags and packages are
+# separate, and one end builds and publishes only while its tag does not exist yet.
 #
-# 版本号取自各包自己的 Cargo.toml，发布说明取自各自的 changelog：
-#   baihua-cli/Cargo.toml          + CHANGELOG_CLI.md   -> cli-v<版本>
-#   baihua-client-gui/Cargo.toml   + CHANGELOG_GUI.md   -> gui-v<版本>
-#   baihua-client-tui/Cargo.toml   + CHANGELOG_TUI.md   -> tui-v<版本>
+# The version comes from each package's own Cargo.toml, the notes from its changelog:
+#   baihua-cli/Cargo.toml          + CHANGELOG_CLI.md   -> cli-v<version>
+#   baihua-client-gui/Cargo.toml   + CHANGELOG_GUI.md   -> gui-v<version>
+#   baihua-client-tui/Cargo.toml   + CHANGELOG_TUI.md   -> tui-v<version>
 #
-# 因此"只更新一个 changelog 并改一个包的版本"只会发那一端；
-# 若一次改动同时动了两三个包，则会同时发出对应的几个版本，互不干扰。
+# Updating one changelog and one package version therefore releases that end only,
+# while a change touching several packages releases each of them side by side.
 #
-# 某一端要发版需要同时满足两条：该包 Cargo.toml 里的版本号在 changelog 里有对应的
-# `## [版本]` 段；且该版本的标签还不存在。只改代码、没写 changelog 段的一端不会发版
-# （prepare 任务会给一条 warning 说明），免得推一次代码就意外放出三端新版本。
-# 每次构建产物：
-#   baihua-cli-<版本>-<目标平台>.tar.gz / .zip  （包内是 `baihua` 与 config/）
-#   baihua-gui-<版本>-<目标平台>.tar.gz / .zip  （包内是 `baihua-gui` 与 config/）
-#   baihua-tui-<版本>-<目标平台>.tar.gz / .zip  （包内是 `baihua-tui` 与 config/）
-# 每个包旁边都带一个同名 .sha256 摘要文件，客户端自动更新前会核对摘要。
+# An end releases when both hold: its Cargo.toml version has a `## [version]` section
+# in its changelog, and that tag does not exist yet. Code without a changelog section
+# stays unpublished (the prepare job logs a warning), so a push never releases by accident.
+# Artifacts of every build:
+#   baihua-cli-<version>-<target>.tar.gz / .zip  (holding `baihua` and config/)
+#   baihua-gui-<version>-<target>.tar.gz / .zip  (holding `baihua-gui` and config/)
+#   baihua-tui-<version>-<target>.tar.gz / .zip  (holding `baihua-tui` and config/)
+# Each package carries a matching .sha256 digest, which the client verifies before updating.
 
 name: Build Release
 
@@ -31,10 +31,9 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 逐端读取版本、changelog 与已有标签：判断哪几端需要发版，并把需要构建的
-  # （端 × 目标平台）组合拼成一份矩阵给下面的构建任务。
-  # 判据是"该端版本的标签还不存在"，所以同一版本不会重复发布；
-  # 三端各自判断、互不影响，一次也可以放出多个端。
+  # Read each end's version, changelog and existing tags, decide which ends release,
+  # and build the (end x target) matrix for the build job. The criterion is "the tag
+  # of that version does not exist yet", so one version is never published twice.
   # ---------------------------------------------------------------------------
   prepare:
     name: Prepare release metadata
@@ -56,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # 需要看到仓库里已有的标签，才能判断某一端的这个版本是不是已经发过了
+          # The existing tags are needed to tell whether this version was released
           fetch-depth: 0
 
       - name: Read versions, changelogs and existing tags
@@ -65,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 读取一个包 Cargo.toml 里的版本号
+          # Read the version out of one package's Cargo.toml
           read_version() {
             local manifest_path="$1"
             if [ ! -f "$manifest_path" ]; then
@@ -74,7 +73,7 @@ jobs:
             grep -m1 '^version' "$manifest_path" | sed 's/.*"\(.*\)".*/\1/'
           }
 
-          # 取出 changelog 里当前版本那一段：`## [版本]` 到下一个 `## [` 之前
+          # Take the changelog section of this version: `## [version]` up to the next one
           read_changelog_section() {
             local changelog_path="$1"
             local version="$2"
@@ -91,18 +90,20 @@ jobs:
             ' "$changelog_path"
           }
 
-          # 目标平台：| 分隔的四段是 目标三元组|runner|压缩包后缀|可执行文件后缀
-          target_specifications=(
-            "aarch64-apple-darwin|macos-latest|tar.gz|"
-            "x86_64-apple-darwin|macos-latest|tar.gz|"
-            "x86_64-pc-windows-msvc|windows-latest|zip|.exe"
-            "x86_64-unknown-linux-gnu|ubuntu-latest|tar.gz|"
+          # Targets: five fields are triplet, runner, archive suffix,
+          # executable suffix and the installer kind for that target.
+            "aarch64-apple-darwin|macos-latest|tar.gz||dmg"
+            "x86_64-apple-darwin|macos-latest|tar.gz||dmg"
+            "x86_64-pc-windows-msvc|windows-latest|zip|.exe|msi"
+            "x86_64-unknown-linux-gnu|ubuntu-latest|tar.gz||appimage"
+            "aarch64-linux-android|ubuntu-latest|apk||apk"
+            "aarch64-apple-ios|macos-latest|ipa||ipa"
           )
 
-          # 三端：| 分隔的六段是 产品名|包目录|标签前缀|安装包名前缀|可执行文件名|changelog 文件
-          product_specifications=(
+          # Ends: seven fields are product, package, tag prefix, package prefix,
+          # binary, changelog and the bundle name an installer package uses.
             "cli|baihua-cli|cli-v|baihua-cli-|baihua|CHANGELOG_CLI.md"
-            "gui|baihua-client-gui|gui-v|baihua-gui-|baihua-gui|CHANGELOG_GUI.md"
+            "gui|baihua-client-gui|gui-v|baihua-gui-|baihua-gui|CHANGELOG_GUI.md|Baihua"
             "tui|baihua-client-tui|tui-v|baihua-tui-|baihua-tui|CHANGELOG_TUI.md"
           )
 
@@ -115,7 +116,7 @@ jobs:
           }
 
           for product_specification in "${product_specifications[@]}"; do
-            IFS='|' read -r product package_directory tag_prefix package_prefix executable_name changelog_file <<< "$product_specification"
+            IFS='|' read -r product package_directory tag_prefix package_prefix executable_name changelog_file bundle_name <<< "$product_specification"
             version="$(read_version "${package_directory}/Cargo.toml")"
             if [ -z "$version" ]; then
               echo "::error::cannot read the version from ${package_directory}/Cargo.toml"
@@ -133,8 +134,8 @@ jobs:
             esac
             changelog_body="$(read_changelog_section "$changelog_file" "$version")"
             if [ -z "$changelog_body" ]; then
-              # 没有这一版的 changelog 段就说明这一端还没准备好发版：跳过，
-              # 只在运行日志里给一条 warning，避免"推一次改动就顺带放出一个新版本"。
+              # No changelog section for this version means the end is not ready to
+              # release: skip it and log a warning, so a push never releases by accident.
               if [ "$release" = "true" ]; then
                 echo "::warning::${changelog_file} has no section for ${version}; the ${product} end is not released this time"
               fi
@@ -152,15 +153,22 @@ jobs:
             echo "${product}: version ${version}, tag ${tag}, release ${release}"
             if [ "$release" = "true" ]; then
               for target_specification in "${target_specifications[@]}"; do
-                IFS='|' read -r target runner archive_extension executable_extension <<< "$target_specification"
-                append_matrix_entry "{\"product\":\"${product}\",\"package\":\"${package_directory}\",\"binary\":\"${executable_name}${executable_extension}\",\"version\":\"${version}\",\"tag\":\"${tag}\",\"package_prefix\":\"${package_prefix}\",\"target\":\"${target}\",\"runner\":\"${runner}\",\"archive_extension\":\"${archive_extension}\",\"standalone\":\"${package_prefix}${version}-${target}${executable_extension}\"}"
+                IFS='|' read -r target runner archive_extension executable_extension package_kind <<< "$target_specification"
+                case "$package_kind" in
+                  apk|ipa)
+                    # Phone installers exist for the graphical end only: the
+                    # command line and terminal ends keep the desktop triples.
+                    [ "$product" = "gui" ] || continue
+                    ;;
+                esac
+                append_matrix_entry "{\"product\":\"${product}\",\"package\":\"${package_directory}\",\"binary\":\"${executable_name}${executable_extension}\",\"version\":\"${version}\",\"tag\":\"${tag}\",\"package_prefix\":\"${package_prefix}\",\"target\":\"${target}\",\"runner\":\"${runner}\",\"package_kind\":\"${package_kind}\",\"bundle_name\":\"${bundle_name}\",\"archive_extension\":\"${archive_extension}\",\"standalone\":\"${package_prefix}${version}-${target}${executable_extension}\"}"
               done
             fi
           done
           echo "build_matrix=[${build_matrix_entries}]" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # 无论这次要不要发版，每次都跑一遍格式、clippy 与测试
+  # Formatting, clippy and tests run on every push, release or not
   # ---------------------------------------------------------------------------
   check:
     name: Lint and test
@@ -185,7 +193,7 @@ jobs:
         run: cargo test --workspace
 
   # ---------------------------------------------------------------------------
-  # 构建矩阵：只包含这次需要发版的那几端，每端四个平台各一个 runner
+  # The build matrix holds only the ends releasing now, one runner per target
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.product }} for ${{ matrix.target }}
@@ -208,11 +216,12 @@ jobs:
           key: ${{ matrix.product }}-${{ matrix.target }}
 
       - name: Build release binary
+        if: matrix.package_kind != 'apk' && matrix.package_kind != 'ipa'
         run: cargo build --release -p ${{ matrix.package }} --target ${{ matrix.target }}
 
-      # -- 打包（Unix） --------------------------------------------------------
+      # -- Packaging (Unix) ----------------------------------------------------
       - name: Package (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.bundle_name == ''
         shell: bash
         run: |
           archive="${{ matrix.package_prefix }}${{ matrix.version }}-${{ matrix.target }}.tar.gz"
@@ -228,9 +237,9 @@ jobs:
           echo "archive=${archive}" >> "$GITHUB_ENV"
           rm -rf "${staging}"
 
-      # -- 打包（Windows） -----------------------------------------------------
+      # -- Packaging (Windows) -------------------------------------------------
       - name: Package (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.bundle_name == ''
         shell: pwsh
         run: |
           $archive = "${{ matrix.package_prefix }}${{ matrix.version }}-${{ matrix.target }}.zip"
@@ -247,7 +256,60 @@ jobs:
           echo "archive=${archive}" >> $env:GITHUB_ENV
           Remove-Item -Recurse -Force $staging
 
-      # -- 上传安装包与摘要 ----------------------------------------------------
+      # -- Toolchains only installer kinds need (each cheap, each conditional) --
+      - name: Install the Windows installer builder
+        if: matrix.package_kind == 'msi'
+        shell: bash
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Install the Android toolchain
+        if: matrix.package_kind == 'apk'
+        shell: bash
+        run: |
+          cargo install cargo-apk --locked
+          sdkmanager "ndk;27.2.12479018" > /dev/null
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install the macOS disk image builder
+        if: matrix.package_kind == 'dmg'
+        shell: bash
+        run: |
+          python3 -m venv "$HOME/dmgbuild-environment"
+          "$HOME/dmgbuild-environment/bin/pip" install dmgbuild
+          echo "DMGBUILD_PYTHON=$HOME/dmgbuild-environment/bin/python3" >> "$GITHUB_ENV"
+
+      - name: Install the Linux AppImage builder
+        if: matrix.package_kind == 'appimage'
+        shell: bash
+        run: |
+          curl -fL -o "$HOME/linuxdeploy" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/latest/download/linuxdeploy-x86_64.AppImage
+          chmod +x "$HOME/linuxdeploy"
+          echo "LINUXDEPLOY=$HOME/linuxdeploy" >> "$GITHUB_ENV"
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+      # -- Bundle ends: one installer package per platform --------------
+      # Every kind routes through scripts/build_packages.sh, the same entry a
+      # developer runs locally, so CI and the machine can never diverge.
+      - name: Package the installer bundle
+        if: matrix.bundle_name != ''
+        shell: bash
+        run: |
+          case "${{ matrix.package_kind }}" in
+            dmg)
+              case "${{ matrix.target }}" in
+                aarch64*) arch=arm ;;
+                *) arch=x86 ;;
+              esac
+              scripts/build_packages.sh --end gui --platform mac --arch "$arch"
+              ;;
+            msi) scripts/build_packages.sh --end gui --platform windows ;;
+            appimage) scripts/build_packages.sh --end gui --platform linux ;;
+            apk) scripts/build_packages.sh --end gui --platform android ;;
+            ipa) scripts/build_packages.sh --end gui --platform ios ;;
+          esac
+
+      # -- Upload the package and its digest -----------------------------------
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
@@ -257,13 +319,15 @@ jobs:
             ${{ env.archive }}.sha256
           retention-days: 30
 
-      # -- 上传单独的可执行文件（供直接下载） ----------------------------------
+      # -- Upload the standalone executable (for a direct download) -------------
       - name: Stage standalone executable
+        if: matrix.bundle_name == ''
         shell: bash
         run: |
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.standalone }}"
 
       - name: Upload standalone executable
+        if: matrix.bundle_name == ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.standalone }}
@@ -271,7 +335,7 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 三端各自发布：某一端这次不需要发版时，对应任务整体跳过
+  # Each end publishes on its own; the job is skipped entirely when it is not releasing
   # ---------------------------------------------------------------------------
   release-cli:
     name: Publish command line release

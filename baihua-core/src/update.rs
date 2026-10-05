@@ -1,27 +1,29 @@
-//! 客户端版本更新：查发布页、比版本、下载并校验安装包。
+//! Client version updates: query the release feed, compare versions, download and verify packages.
 //!
-//! 发布产物放在 GitHub Releases（仓库 binder-organization/Baihua-Client）。约定：
-//! - 三端各有各的更新通道，标签前缀分别是 `cli-v`（命令行版 `baihua`）、`gui-v`（图形版 `baihua-gui`）、
-//!   `tui-v`（终端版 `baihua-tui`）；三端版本号各自走，互不牵连，检查与更新也是各查各的；
-//! - 每个平台一个压缩包，文件名 = 包名前缀 + 版本号 + 目标平台三元组；
-//!   包名前缀是 `baihua-cli-`、`baihua-gui-`、`baihua-tui-`（终端版还兼容历史包名 `baihua-<版本>-<平台>`，
-//!   因为发布页上已有的包是这个名字），Windows 用 `.zip`，其余平台用 `.tar.gz`；
-//! - 每个包旁边必须放一个同名加 `.sha256` 的摘要文件（允许 `sha256sum` 那种
-//!   `<摘要>  <文件名>` 两列写法），落地之前先核对摘要，不符就丢弃——发布页被整体换包时
-//!   摘要文件与包一起被换掉的概率极低，这道校验是"自动更新不会被中间人换包"的最低保障；
-//! - 选包时**从新到旧逐版回退**：最新一版没有本平台的包（发布页被旧工作流传坏过，
-//!   例如 `tui-v0.1.0` 的资产名里版本号为空、包内可执行文件还是旧名 `baihua`），
-//!   就继续看更早的版本，装"能装上的最新一版"，而不是整条通道卡死；
-//!   认不出的包名（如 `baihua--<平台>`）绝不认领——那种包解出来的可执行文件会装错端。
+//! Release artifacts live on GitHub Releases (repository binder-organization/Baihua-Client). The rules:
+//! - Each of the three ends has its own update channel with its tag prefix: `cli-v` (command line, `baihua`), `gui-v` (graphical, `baihua-gui`),
+//!   `tui-v` (terminal, `baihua-tui`); the three version numbers evolve independently, and check/update runs per end;
+//! - One package per platform, named package prefix + version + target platform triple;
+//!   the prefixes are `baihua-cli-`, `baihua-gui-`, `baihua-tui-` (the terminal version also
+//!   accepts the historic package names `baihua-<version>-<platform>` because the feed already carries them),
+//!   the command line and terminal ends use `.zip` on Windows and `.tar.gz` elsewhere,
+//!   the graphical end ships `.dmg` (macOS), `.msi` (Windows) and `.AppImage` (Linux);
+//! - Every package must sit next to a same-named `.sha256` digest file (the two-column
+//!   `<digest>  <filename>` form of `sha256sum` is allowed); the digest is verified before anything is
+//!   written out and a mismatch discards the download — a wholesale feed swap would have to replace the digests too, so this check is the minimum guarantee that a man in the middle cannot swap the package under auto-update;
+//! - Package selection **walks the releases newest to oldest**: when the newest release has no package
+//!   for this platform (an old workflow once poisoned the feed: `tui-v0.1.0` carried an asset name with
+//!   an empty version and the old executable name `baihua`), older releases are tried, installing the newest
+//!   installable release instead of jamming the whole channel; unrecognized names (like `baihua--<platform>`) are never claimed — such archives would install the wrong end.
 
 use crate::paths;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// 发布页上一个安装包的必要信息。
+/// The necessary information about one install package on the release feed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReleasePackage {
-    /// 去掉 `tui-v` 前缀后的版本号，用于与内置版本直接比较
+    /// The version with the channel prefix removed, compared directly against the built-in version
     pub version: String,
     pub tag: String,
     pub file_name: String,
@@ -29,25 +31,25 @@ pub struct ReleasePackage {
     pub size_bytes: u64,
 }
 
-/// 一次更新检查的结果。
+/// The outcome of one update check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateCheck {
-    /// 已是最新：带上发布页上看到的最新标签与该标签下的安装包文件名，
-    /// 便于 `update --check` 直接回答"到底看到了什么、为什么判成没有更新"
+    /// Already up to date: carries the newest tag seen on the feed and the package file name under it,
+    /// so `update --check` can answer "what exactly did you see and why did you decide there is no update"
     UpToDate {
         newest_tag: String,
         newest_assets: Vec<String>,
     },
-    /// 有可用更新
+    /// An update is available
     Available(ReleasePackage),
-    /// 无法完成检查（网络、解析、平台上没有对应包），携带可直接展示的原因
+    /// The check could not finish (network, parsing, no package for this platform), carrying a displayable reason
     Unavailable(String),
 }
 
 #[derive(Deserialize)]
 struct GitHubRelease {
     tag_name: String,
-    /// 草稿态发布对 API 之外的用户不可见，绝不能再客户端里被当成可用版本
+    /// Draft releases are invisible to everyone but the author and must never count as available in a client
     #[serde(default)]
     draft: bool,
     #[serde(default)]
@@ -62,20 +64,20 @@ struct GitHubAsset {
     size: u64,
 }
 
-/// 发布通道：命令行版、图形版、终端版各自一条更新流。标签前缀不同（`cli-v`、`gui-v`、`tui-v`），
-/// 安装包名前缀也不同，因此几个包放进同一个发布里也不会互相装错程序。
+/// Release channels: the command line, graphical and terminal ends each run their own update stream. The tag prefixes differ (`cli-v`, `gui-v`, `tui-v`)
+/// and so do the package prefixes, so even shared releases never install the wrong program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseChannel {
-    /// 命令行版：标签 `cli-v<版本>`，包名 `baihua-cli-<版本>-<平台>.tar.gz`
+    /// Command line end: tag `cli-v<version>`, package `baihua-cli-<version>-<platform>.tar.gz`
     CommandLine,
-    /// 图形版：标签 `gui-v<版本>`，包名 `baihua-gui-<版本>-<平台>.tar.gz`
+    /// Graphical end: tag `gui-v<version>`, package `baihua-gui-<version>-<platform>.tar.gz`
     Graphical,
-    /// 终端版：标签 `tui-v<版本>`，包名 `baihua-tui-<版本>-<平台>.tar.gz`（兼容历史包名 `baihua-<版本>-<平台>`）
+    /// Terminal end: tag `tui-v<version>`, package `baihua-tui-<version>-<platform>.tar.gz` (also accepts the historic `baihua-<version>-<platform>`)
     Terminal,
 }
 
 impl ReleaseChannel {
-    /// 只认这个前缀的标签是本通道的发布，其余（例如服务端标签或另一侧客户端）忽略
+    /// Only tags with this prefix belong to this channel; everything else (server tags, the other clients) is ignored
     fn tag_prefix(self) -> String {
         match self {
             ReleaseChannel::CommandLine => "cli-v".to_string(),
@@ -84,9 +86,9 @@ impl ReleaseChannel {
         }
     }
 
-    /// 某个附件名是不是本通道的安装包。选包时必须按通道分辨，否则各端的包会互相认错。
-    /// 终端版额外接受历史包名 `baihua-<版本>-<平台>`：`baihua-` 后面紧跟版本号数字才算，
-    /// 这样 `baihua-cli-...`、`baihua-gui-...` 不会被终端版认领。
+    /// Whether an attachment name is this channel's package. Selection must discriminate by channel or the ends would claim each other's packages.
+    /// The terminal end additionally accepts the historic `baihua-<version>-<platform>`: only when a version digit follows `baihua-` directly,
+    /// so `baihua-cli-...` and `baihua-gui-...` are never claimed by the terminal channel.
     fn package_name_matches(self, name: &str) -> bool {
         match self {
             ReleaseChannel::CommandLine => name.starts_with("baihua-cli-"),
@@ -101,7 +103,27 @@ impl ReleaseChannel {
         }
     }
 
-    /// 命令行与界面里显示这条通道时用的名字（`baihua update` 的逐端报告用）
+    /// Whether an attachment is an installable package for this channel. The
+    /// command line and terminal ends ship archives; the graphical end ships a
+    /// macOS disk image, a Windows installer and a Linux AppImage, and still
+    /// accepts the historic archives so an older release remains installable.
+    fn accepts_asset(self, name: &str) -> bool {
+        if !self.package_name_matches(name) {
+            return false;
+        }
+        let archive = name.ends_with(".tar.gz") || name.ends_with(".zip");
+        match self {
+            ReleaseChannel::CommandLine | ReleaseChannel::Terminal => archive,
+            ReleaseChannel::Graphical => {
+                archive
+                    || name.ends_with(".dmg")
+                    || name.ends_with(".msi")
+                    || name.ends_with(".AppImage")
+            }
+        }
+    }
+
+    /// The name this channel shows in command line and interface reports (per-end output of `baihua update`)
     pub fn display_name(self) -> &'static str {
         match self {
             ReleaseChannel::CommandLine => "command line",
@@ -111,9 +133,9 @@ impl ReleaseChannel {
     }
 }
 
-/// 发布页地址。GitHub API 要求带 User-Agent（否则直接 403），已在请求里给。
-/// 设了 `BAIHUA_RELEASE_FEED` 就改用该地址（本地假发布页或内网镜像），
-/// 目的是在不往正式仓库发版的情况下，也能把"检查→下载→校验→解包→安装"整条链路验证一遍。
+/// The release feed address. The GitHub API demands a User-Agent (a plain 403 otherwise); the request carries one.
+/// When `BAIHUA_RELEASE_FEED` is set that address is used instead (a local fake feed or an intranet mirror),
+/// so the whole "check, download, verify, unpack, install" chain can be exercised without publishing to the real repository.
 fn releases_api_url() -> String {
     if let Some(override_url) = std::env::var_os("BAIHUA_RELEASE_FEED") {
         let url = override_url.to_string_lossy().trim().to_string();
@@ -125,7 +147,7 @@ fn releases_api_url() -> String {
         .to_string()
 }
 
-/// 当前平台在安装包文件名里出现的片段（与 BUILDING.md 的产物命名一致）。
+/// The fragment of the current platform in package file names (matching the naming in BUILDING.md).
 fn current_platform_token() -> String {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin".to_string(),
@@ -138,8 +160,8 @@ fn current_platform_token() -> String {
     }
 }
 
-/// 比较两个版本号：先按点分主/次/修订号比数值，再比预发布标记（预发布早于正式版）。
-/// 解析不了的片段按 0 处理，因此 "0.1.0-alpha.2" < "0.1.0"。
+/// Compare two version numbers: dotted major/minor/patch numerically first, then prerelease tags (a prerelease precedes its release).
+/// Unparseable pieces count as 0, so "0.1.0-alpha.2" < "0.1.0".
 pub fn is_version_newer(candidate: &str, current: &str) -> bool {
     fn split(text: &str) -> (Vec<u64>, Option<String>) {
         let (numeric, pre_release) = match text.split_once('-') {
@@ -154,7 +176,7 @@ pub fn is_version_newer(candidate: &str, current: &str) -> bool {
     }
     let (candidate_numbers, candidate_pre) = split(candidate.trim_start_matches('v'));
     let (current_numbers, current_pre) = split(current.trim_start_matches('v'));
-    // 位数不一致时短的那边按 0 补齐比较（"0.1" 与 "0.1.0" 视为相等）
+    // When the two versions carry different numbers of segments, the shorter one is padded with zeros ("0.1" equals "0.1.0")
     let digit_count = candidate_numbers.len().max(current_numbers.len());
     for position in 0..digit_count {
         let candidate_value = *candidate_numbers.get(position).unwrap_or(&0);
@@ -167,15 +189,15 @@ pub fn is_version_newer(candidate: &str, current: &str) -> bool {
         (Some(candidate_marker), Some(current_marker)) => {
             pre_release_order(candidate_marker, current_marker)
         }
-        // 同一版本号下，带预发布标记的一版早于正式版
+        // For the same numeric version, the one carrying a prerelease tag is older than the plain release
         (Some(_), None) => false,
         (None, Some(_)) => true,
         (None, None) => false,
     }
 }
 
-/// 预发布标记逐段比较："alpha.10" 要大于 "alpha.2"（纯按字符串比会反过来），
-/// 因此两侧都能读成数字的段按数值比，其余段按文本比。
+/// Prerelease tags compare segment by segment: "alpha.10" must beat "alpha.2" (a pure string compare flips this),
+/// so segments that parse as numbers on both sides compare numerically and the rest compare as text.
 fn pre_release_order(candidate_marker: &str, current_marker: &str) -> bool {
     let candidate_parts: Vec<&str> = candidate_marker.split('.').collect();
     let current_parts: Vec<&str> = current_marker.split('.').collect();
@@ -195,7 +217,7 @@ fn pre_release_order(candidate_marker: &str, current_marker: &str) -> bool {
     false
 }
 
-/// 拉取发布页 JSON。与"怎么挑包"分开，挑包逻辑就能在测试里喂假发布页验证。
+/// Fetch the release feed JSON. Kept apart from "how to pick a package" so tests can feed a fake feed to the picking logic.
 fn fetch_releases() -> Result<Vec<GitHubRelease>, String> {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -221,8 +243,8 @@ fn fetch_releases() -> Result<Vec<GitHubRelease>, String> {
         .map_err(|error| format!("release feed parse failed: {error}"))
 }
 
-/// 查询发布页，返回相对 `current_version` 更新的、且本平台有包的最新发布版本。
-/// `channel` 决定看哪一串标签、认哪一种包名。
+/// Query the feed and return the newest release that is newer than `current_version` and carries a package for this platform.
+/// `channel` decides which tag series to read and which package names to accept.
 pub fn check_for_update(current_version: &str, channel: ReleaseChannel) -> UpdateCheck {
     match fetch_releases() {
         Err(reason) => UpdateCheck::Unavailable(reason),
@@ -235,11 +257,11 @@ pub fn check_for_update(current_version: &str, channel: ReleaseChannel) -> Updat
     }
 }
 
-/// 在已解析的发布列表里挑要装的包（发布页按创建时间倒序返回，这里按同一顺序从新到旧走）。
-/// 只看带本通道标签前缀、且版本比 `current_version` 新的发布；**最新一版没有本平台包时
-/// 不回退失败，而是继续看更早的版本**——发布页上真实出现过名字传坏的最新版
-/// （`tui-v0.1.0`，资产名 `baihua--<平台>` 且包内可执行文件是旧名），一版坏包不该锁死整条通道。
-/// 所有比当前新的版本都没有本平台包时，用最新那一版的信息解释原因。
+/// Pick the package to install from the parsed release list (the feed returns releases newest-first and this walks them in that order).
+/// Only releases tagged for this channel and newer than `current_version` count; **when the newest one
+/// lacks a package for this platform the walk does not fail but continues to older releases** — the real feed
+/// once carried a poisoned newest release (`tui-v0.1.0`, asset `baihua--<platform>`, old executable inside); one bad release must not lock the channel.
+/// When every newer release lacks a package for this platform, the newest release's data explains why.
 fn select_package_from_releases(
     releases: &[GitHubRelease],
     current_version: &str,
@@ -249,11 +271,11 @@ fn select_package_from_releases(
     let prefix = channel.tag_prefix();
     let mut newest_tag = String::new();
     let mut newest_assets: Vec<String> = Vec::new();
-    // (版本号, 标签, 资产名) —— 第一条"版本更新但没有本平台包"的记录，用于最终解释
+    // (version, tag, asset names) —— the first "newer but no package for this platform" record, kept for the final explanation
     let mut newest_missing_package: Option<(String, String, Vec<String>)> = None;
     for release in releases {
-        // 草稿是作者自己还没发布的东西，跳过；预发布不跳——客户端正处在 alpha，
-        // 带包的就是这类发布，过滤掉等于把唯一的更新通道关掉
+        // Drafts are unpublished author work and are skipped; prereleases are not — the clients are in alpha
+        // and the packaged releases are exactly those; filtering them would close the only update channel
         if release.draft {
             continue;
         }
@@ -273,9 +295,7 @@ fn select_package_from_releases(
             continue;
         }
         let Some(asset) = release.assets.iter().find(|asset| {
-            channel.package_name_matches(&asset.name)
-                && asset.name.contains(platform_token)
-                && (asset.name.ends_with(".tar.gz") || asset.name.ends_with(".zip"))
+            channel.accepts_asset(&asset.name) && asset.name.contains(platform_token)
         }) else {
             if newest_missing_package.is_none() {
                 newest_missing_package =
@@ -302,7 +322,7 @@ fn select_package_from_releases(
     }
 }
 
-/// 下载安装包并校验摘要，成功后返回本地文件路径；任何一步失败都不留下可用的半成品。
+/// Download the package and verify its digest, returning the local path on success; no step failure leaves a usable half-file behind.
 pub fn download_package(package: &ReleasePackage) -> Result<std::path::PathBuf, String> {
     let directory = paths::update_directory().ok_or_else(|| {
         "cannot locate the update directory; check BAIHUA_DIR and HOME".to_string()
@@ -339,7 +359,7 @@ pub fn download_package(package: &ReleasePackage) -> Result<std::path::PathBuf, 
     Ok(archive_path)
 }
 
-/// 计算字节串的 SHA-256 十六进制摘要（与 `sha256sum` 输出同形，便于人工核对）。
+/// Hex SHA-256 digest of a byte string (shaped like `sha256sum` output so people can cross-check).
 pub fn sha256_hex_of(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest
@@ -348,7 +368,7 @@ pub fn sha256_hex_of(bytes: &[u8]) -> String {
         .collect::<String>()
 }
 
-/// 摘要附属文件允许写成 `sha256sum` 的 "<digest>  <filename>" 形式，取前导摘要字段并小写化。
+/// A digest attachment may use the `sha256sum` "<digest>  <filename>" form; take the leading digest field and lowercase it.
 fn normalize_digest_text(text: &str) -> String {
     text.split_whitespace()
         .next()
@@ -369,16 +389,16 @@ mod tests {
         assert!(!is_version_newer("0.1.0", "0.1.0"));
         assert!(is_version_newer("0.1.0-alpha.3", "0.1.0-alpha.2"));
         assert!(!is_version_newer("0.1.0-alpha.2", "0.1.0-alpha.3"));
-        // 预发布序号超过一位数时不能按字符串比较
+        // Prerelease counters beyond one digit must not compare as strings
         assert!(is_version_newer("0.1.0-alpha.10", "0.1.0-alpha.2"));
         assert!(!is_version_newer("0.1.0-alpha.2", "0.1.0-alpha.10"));
         assert!(is_version_newer("0.1.0-beta.1", "0.1.0-alpha.9"));
-        // 位数不同的版本号按零补齐比较
+        // Versions with different segment counts compare zero-padded
         assert!(is_version_newer("0.1.0.1", "0.1.0"));
         assert!(!is_version_newer("0.1", "0.1.0"));
     }
 
-    /// 造一条发布页记录：标签 + 一组资产名（下载地址与大小对选包逻辑无意义，给占位值）。
+    /// Build a fake feed record: tag + asset names (download addresses and sizes do not matter to the picking logic, so they are placeholders).
     fn fake_release(tag: &str, draft: bool, asset_names: &[&str]) -> GitHubRelease {
         GitHubRelease {
             tag_name: tag.to_string(),
@@ -394,9 +414,9 @@ mod tests {
         }
     }
 
-    /// 发布页真实出现过的坏包：`tui-v0.1.0` 的资产名里版本号为空（`baihua--<平台>`），
-    /// 包内可执行文件还是旧名。这样的最新发布不能锁死通道，必须回退到
-    /// 更早但包名端正、本平台有包的发布。
+    /// A poisoned release that really happened: `tui-v0.1.0` carried an asset name whose version was empty (`baihua--<platform>`),
+    /// with the old executable name inside. Such a newest release must not lock the channel; the walk must fall back to
+    /// an older, correctly named release that packages this platform.
     #[test]
     fn a_mislabelled_newest_release_falls_back_to_an_older_installable_one() {
         let releases = vec![
@@ -436,8 +456,8 @@ mod tests {
         }
     }
 
-    /// 所有比当前新的发布都没有本平台包时，报**最新那一条**的资产清单，
-    /// 并说明更早的发布也救不了（而不是静默回退成"已是最新"）。
+    /// When no newer release packages this platform, report the asset list of the **newest** release
+    /// and explain that older releases do not rescue it either (instead of silently reporting "up to date").
     #[test]
     fn a_channel_without_any_installable_package_explains_the_newest_release() {
         let releases = vec![
@@ -463,8 +483,8 @@ mod tests {
         }
     }
 
-    /// 回退不能变成降级：候选版本仍然要先通过"比当前版本新"的闸门；
-    /// 通道里全是旧版或根本没有本通道的发布时，照旧回 UpToDate。
+    /// Falling back must never mean downgrading: every candidate still passes the "newer than current" gate;
+    /// when the channel only holds older releases or none at all, the answer stays UpToDate.
     #[test]
     fn fallback_never_downgrades_and_keeps_up_to_date_report() {
         let releases = vec![
@@ -479,7 +499,7 @@ mod tests {
                 &["baihua-gui-0.1.0-aarch64-apple-darwin.tar.gz"],
             ),
         ];
-        // 已装 0.1.1：0.1.0 不比它新，哪怕"能回退"也不能装旧版
+        // Installed 0.1.1: 0.1.0 is not newer, so even a "fall back" must not install the older release
         match select_package_from_releases(
             &releases,
             "0.1.1",
@@ -489,7 +509,7 @@ mod tests {
             UpdateCheck::UpToDate { newest_tag, .. } => assert_eq!(newest_tag, "tui-v0.1.0"),
             other => panic!("expected up-to-date, got {other:?}"),
         }
-        // 终端版通道一条发布都没有：UpToDate 且不带标签（安装路径据此给出"通道还没发布过"的说明）
+        // The terminal channel has no releases at all: UpToDate without a tag (the installer turns that into "the channel has not published yet")
         match select_package_from_releases(
             &releases,
             "0",
@@ -518,8 +538,8 @@ mod tests {
         assert_ne!(sha256_hex_of(b"baihua"), sha256_hex_of(b"BAIHUA"));
     }
 
-    /// 三端的包名前缀互相是前缀关系（`baihua-` 也是 `baihua-cli-`、`baihua-gui-` 的前缀），
-    /// 选包必须按通道分辨：某一端只能认自己那种包名，历史包名只有终端版接受。
+    /// The three package prefixes nest (`baihua-` is also a prefix of `baihua-cli-` and `baihua-gui-`),
+    /// so selection must discriminate by channel: each end claims only its own names, and only the terminal end accepts the historic form.
     #[test]
     fn package_names_are_matched_per_channel() {
         let command_line_package = "baihua-cli-0.1.0-aarch64-apple-darwin.tar.gz";
@@ -530,7 +550,7 @@ mod tests {
         assert!(ReleaseChannel::CommandLine.package_name_matches(command_line_package));
         assert!(ReleaseChannel::Graphical.package_name_matches(graphical_package));
         assert!(ReleaseChannel::Terminal.package_name_matches(terminal_package));
-        // 发布页上已有的终端版包是 `baihua-<版本>-<平台>`，终端版通道仍然要认
+        // The feed already carries terminal packages named `baihua-<version>-<platform>`; the terminal channel must still claim them
         assert!(ReleaseChannel::Terminal.package_name_matches(legacy_terminal_package));
 
         assert!(!ReleaseChannel::Terminal.package_name_matches(command_line_package));
@@ -539,5 +559,67 @@ mod tests {
         assert!(!ReleaseChannel::Graphical.package_name_matches(terminal_package));
         assert!(!ReleaseChannel::CommandLine.package_name_matches(legacy_terminal_package));
         assert!(!ReleaseChannel::Graphical.package_name_matches(legacy_terminal_package));
+
+        // Package formats: the graphical end ships installer formats, the other two never do
+        assert!(
+            ReleaseChannel::Graphical.accepts_asset("baihua-gui-0.2.0-aarch64-apple-darwin.dmg")
+        );
+        assert!(
+            ReleaseChannel::Graphical.accepts_asset("baihua-gui-0.2.0-x86_64-pc-windows-msvc.msi")
+        );
+        assert!(
+            ReleaseChannel::Graphical
+                .accepts_asset("baihua-gui-0.2.0-x86_64-unknown-linux-gnu.AppImage")
+        );
+        assert!(ReleaseChannel::Graphical.accepts_asset(graphical_package));
+        assert!(
+            !ReleaseChannel::CommandLine.accepts_asset("baihua-cli-0.2.0-aarch64-apple-darwin.dmg")
+        );
+        assert!(
+            !ReleaseChannel::Terminal.accepts_asset("baihua-tui-0.2.0-x86_64-pc-windows-msvc.msi")
+        );
+    }
+
+    /// The graphical channel must pick the installer package of this platform from a feed that
+    /// also carries the other platforms and the other ends.
+    #[test]
+    fn graphical_channel_picks_the_installer_for_this_platform() {
+        let releases = [
+            fake_release(
+                "gui-v0.2.0",
+                false,
+                &[
+                    "baihua-gui-0.2.0-aarch64-apple-darwin.dmg",
+                    "baihua-gui-0.2.0-x86_64-apple-darwin.dmg",
+                    "baihua-gui-0.2.0-x86_64-pc-windows-msvc.msi",
+                    "baihua-cli-0.2.0-aarch64-apple-darwin.tar.gz",
+                ],
+            ),
+            fake_release(
+                "gui-v0.1.0",
+                false,
+                &["baihua-gui-0.1.0-aarch64-apple-darwin.dmg"],
+            ),
+        ];
+        for (platform_token, expected) in [
+            (
+                "aarch64-apple-darwin",
+                "baihua-gui-0.2.0-aarch64-apple-darwin.dmg",
+            ),
+            (
+                "x86_64-pc-windows-msvc",
+                "baihua-gui-0.2.0-x86_64-pc-windows-msvc.msi",
+            ),
+        ] {
+            match select_package_from_releases(
+                &releases,
+                "0.1.0",
+                ReleaseChannel::Graphical,
+                platform_token,
+            ) {
+                UpdateCheck::Available(package) => assert_eq!(package.file_name, expected),
+                other => panic!("the graphical channel must offer {expected}, got {other:?}"),
+            }
+        }
     }
 }

@@ -10,26 +10,26 @@
 
 use std::path::PathBuf;
 
-/// 一个字体候选：文件路径与字号索引。
+/// One font candidate: the file path and the index of the face inside it.
 ///
-/// 一个字体文件可能是 `.ttc` 字体集合，里面顺序排着多套字面（如多字重的黑体）。
-/// 索引 `0` 通常是最常规的那一套，与 egui 的 `FontData::index` 语义一致。
+/// A font file may be a `.ttc` collection holding several faces in order (for example multiple weights of one family).
+/// Index `0` is usually the regular face, matching the meaning of egui's `FontData::index`.
 pub struct FontFile {
-    /// 字体文件在磁盘上的完整路径
+    /// Full on-disk path of the font file
     pub path: PathBuf,
-    /// 取文件里的第几套字面（`.ttf`/`.otf` 用 0，`.ttc` 按字体集合的顺序取）
+    /// Which face inside the file to take (0 for `.ttf`/`.otf`, the collection order for `.ttc`)
     pub face_index: u32,
 }
 
-/// 按平台给出带汉字的字体候选（优先级从高到低）。
+/// Font candidates that carry Han glyphs, per platform (highest priority first).
 ///
-/// 只列文件名，不判断是否存在；实际可用的那一份由 `discover_cjk_font` 挑。
-/// 选择原则是"系统自带的常见正文字体优先"：macOS 先苹方后冬青黑体，Windows 先微软雅黑
-/// 后等线，Linux 先思源黑体后文泉驿正黑；再往后放几套几乎必装的兜底字体。
+/// Only lists paths, never checks existence; `discover_cjk_font` picks the one that actually works.
+/// The rule is "the system's usual body font first": macOS prefers PingFang then Hiragino Sans, Windows
+/// prefers Microsoft YaHei then DengXian, Linux prefers Source Han Sans then WenQuanYi Zen Hei; a few near-universal fallbacks follow.
 pub fn cjk_font_candidates() -> Vec<FontFile> {
     let mut candidates: Vec<FontFile> = Vec::new();
 
-    // macOS：苹方是系统界面字，字形最全；冬青黑体与华文黑体依次兜底
+    // macOS: PingFang is the system interface font with the fullest glyph coverage; Hiragino Sans and Heiti SC fall back in order
     for (path, face_index) in [
         ("/System/Library/Fonts/PingFang.ttc", 0),
         ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
@@ -43,7 +43,7 @@ pub fn cjk_font_candidates() -> Vec<FontFile> {
         });
     }
 
-    // Windows：微软雅黑覆盖最广，等线与黑体兜底
+    // Windows: Microsoft YaHei has the widest coverage; DengXian and SimHei fall back
     for (path, face_index) in [
         ("C:/Windows/Fonts/msyh.ttc", 0),
         ("C:/Windows/Fonts/msyh.ttf", 0),
@@ -57,7 +57,28 @@ pub fn cjk_font_candidates() -> Vec<FontFile> {
         });
     }
 
-    // Linux：思源黑体最常见，文泉驿正黑与已安装的 Noto 依次兜底
+    // Android: the system ships the Noto family (newer releases use NotoSansSC, older ones the
+    // NotoSansCJK collection, older still DroidSansFallback); these paths exist only on devices or
+    // emulators, and desktop platforms simply skip them without noise
+    for (path, face_index) in [
+        ("/system/fonts/NotoSansCJK-Regular.ttc", 0),
+        ("/system/fonts/NotoSansSC-Regular.otf", 0),
+        ("/system/fonts/DroidSansFallback.ttf", 0),
+    ] {
+        candidates.push(FontFile {
+            path: PathBuf::from(path),
+            face_index,
+        });
+    }
+
+    // iOS deliberately has no candidate here: an app sandbox cannot read
+    // `/System/Library/Fonts` (an earlier comment claimed the shared macOS paths
+    // covered iOS — the device proved otherwise, Chinese was all tofu boxes).
+    // The GUI ships a subset font inside its own binary for iOS instead, see
+    // `baihua_client_gui::embedded_cjk_font_bytes` and
+    // `assets/fonts/build-subset.py`.
+
+    // Linux: Source Han Sans is the most common; WenQuanYi Zen Hei and any installed Noto fall back in order
     for (path, face_index) in [
         ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
         ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
@@ -77,11 +98,11 @@ pub fn cjk_font_candidates() -> Vec<FontFile> {
     candidates
 }
 
-/// 在候选里挑出第一份真实存在且读得进来的汉字字体，返回它的字节与字号索引。
+/// Pick the first candidate that exists and reads, returning its bytes and face index.
 ///
-/// 读盘失败（权限、文件被占用）不当作致命错误：继续试下一份候选。
-/// 一份都拿不到时返回 None，界面按"没有汉字字体"降级处理（中文显示为占位方框），
-/// 不会因为字体缺失而启动失败。
+/// A failed read (permissions, locked file) is not fatal: the next candidate is tried.
+/// With no candidate readable at all it returns None and the interfaces degrade to "no CJK font"
+/// (Chinese shows as placeholder boxes) instead of failing to start.
 pub fn discover_cjk_font() -> Option<(Vec<u8>, u32)> {
     for candidate in cjk_font_candidates() {
         if !candidate.path.is_file() {
@@ -99,29 +120,34 @@ pub fn discover_cjk_font() -> Option<(Vec<u8>, u32)> {
 mod tests {
     use super::*;
 
-    /// 候选表必须按平台排好且不重复，免得把同一个文件读两遍
+    /// The candidate table must be ordered per platform and free of duplicates, so no file is read twice
     #[test]
     fn candidates_are_not_empty_and_unique() {
         let candidates = cjk_font_candidates();
-        assert!(!candidates.is_empty(), "每个平台上至少要有几个汉字字体候选");
+        assert!(
+            !candidates.is_empty(),
+            "every platform needs at least a few CJK font candidates"
+        );
         let mut seen: Vec<PathBuf> = Vec::new();
         for candidate in &candidates {
             assert!(
                 !seen.contains(&candidate.path),
-                "候选里出现了重复的字体路径: {:?}",
+                "a duplicate font path appeared in the candidates: {:?}",
                 candidate.path
             );
             seen.push(candidate.path.clone());
         }
     }
 
-    /// 在开发机上按真实情况探测：找到了就必须是非空字节，没找到也不该 panic
+    /// Probe on the development machine as it really is: a hit must yield non-empty bytes, a miss must not panic
     #[test]
     fn discovery_returns_readable_bytes_or_nothing() {
         match discover_cjk_font() {
-            Some((bytes, _face_index)) => assert!(!bytes.is_empty(), "读到的字体字节不能为空"),
+            Some((bytes, _face_index)) => {
+                assert!(!bytes.is_empty(), "read font bytes must not be empty")
+            }
             None => {
-                // 这台机器一套候选都没有：属于允许的降级情况，函数本身不该出错
+                // This machine has none of the candidates: a permitted degradation, the function itself must not fail
             }
         }
     }

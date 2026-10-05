@@ -8,8 +8,9 @@ use baihua_core::{
         websocket_auth_sentinel,
     },
     chat_cache::ChatCache,
-    config, crypto, installer, paths,
-    update::{ReleaseChannel, UpdateCheck, check_for_update, download_package},
+    config::{self, Palette},
+    crypto, installer, paths,
+    update::{ReleaseChannel, ReleasePackage, UpdateCheck, check_for_update, download_package},
 };
 use chrono::{DateTime, Local};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -156,6 +157,18 @@ enum FormAction {
     DeleteAccount,
 }
 
+/// How far the offered update has come: waiting for the answer, downloading after a yes,
+/// or holding the verified package that is ready to install.
+#[derive(Clone, Debug)]
+enum UpdateStage {
+    /// The notice told about the new version; nothing has been fetched yet
+    AwaitingAnswer,
+    /// The person accepted and the package is arriving on a background thread
+    Downloading,
+    /// The package landed and passed its digest check; the value is its local path
+    Package(PathBuf),
+}
+
 /// Encryption session phase
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EncryptionPhase {
@@ -264,6 +277,9 @@ struct Appearance {
     search_current_match_background: Color,
     // Read/unread status text color below messages
     read_state_text: Color,
+    // Tint color for button images: only the graphical client draws images, the
+    // terminal keeps the slot so one theme file serves both interfaces
+    icon_color: Color,
 }
 
 /// Color notation in theme files: supports hex "#rrggbb", terminal basic color names, and [red, green, blue] three-element arrays.
@@ -362,10 +378,10 @@ impl Appearance {
     /// and also serves as the fallback color when a theme file has missing slots, ensuring users without a configured theme see the original effect.
     fn built_in() -> Self {
         Self {
-            app_background: Color::Reset,
-            message_border: Color::Cyan,
-            room_border: Color::Cyan,
-            overlay_border: Color::Cyan,
+            app_background: Color::Rgb(43, 48, 56),
+            message_border: Color::Rgb(91, 107, 125),
+            room_border: Color::Rgb(91, 107, 125),
+            overlay_border: Color::Rgb(107, 122, 141),
             message_text: Color::White,
             selected_text: Color::Yellow,
             other_username_text: Color::Cyan,
@@ -374,7 +390,7 @@ impl Appearance {
             hint_text: Color::DarkGray,
             notice_hint_border: Color::Blue,
             notice_error_border: Color::Red,
-            input_border: Color::Cyan,
+            input_border: Color::Rgb(91, 107, 125),
             input_text: Color::White,
             command_border: Color::Yellow,
             search_border: Color::Red,
@@ -382,13 +398,18 @@ impl Appearance {
             search_match_background: Color::Red,
             search_current_match_background: Color::LightYellow,
             read_state_text: Color::Blue,
+            icon_color: Color::Rgb(147, 165, 184),
         }
     }
 
     // Read `<config_dir>/themes/{name}.json`, returning the complete appearance struct at once.
     // The second tuple element is the "missing field" flag: true if any slot is missing, following theme conventions the specific missing field is not listed;
     /// The third element is the list of unknown field names extra in the theme file.
-    /// Returns the built-in default appearance when the file is unreadable or not valid JSON, with the missing field flag set to true.
+    /// Returns the built-in fallback appearance when the file is unreadable or not valid JSON, with the missing field flag set to true.
+    ///
+    /// There is no reserved name any more: the default appearance (`Palette::default_name`) is an
+    /// ordinary theme file shipped under `config/themes`, loaded through this same path. The retired
+    /// name `built_in` has no file and is honestly reported as incomplete.
     fn load(name: &str) -> (Self, bool, Vec<String>) {
         let mut appearance = Self::built_in();
         let path = paths::config_path(&format!("themes/{name}.json"));
@@ -425,6 +446,7 @@ impl Appearance {
                 &mut appearance.search_current_match_background,
             ),
             ("read_state_text", &mut appearance.read_state_text),
+            ("icon_color", &mut appearance.icon_color),
         ];
         let known_field_names: Vec<&str> = slots.iter().map(|(field, _)| *field).collect();
         let mut has_missing_field = false;
@@ -462,9 +484,11 @@ impl Appearance {
         }
     }
 
-    /// List all available appearance names under config/themes (removing .json suffix), sorted alphabetically
+    /// List all available appearance names: the theme files under `config/themes` (`.json` suffix
+    /// removed), sorted alphabetically and deduplicated. Every entry is backed by a real theme file —
+    /// the default appearance comes from its shipped `themes/default.json`, no reserved name is injected.
     fn available_names() -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(paths::config_directory().join("themes"))
+        let mut file_names: Vec<String> = fs::read_dir(paths::config_directory().join("themes"))
             .into_iter()
             .flatten()
             .filter_map(|entry| entry.ok())
@@ -483,8 +507,9 @@ impl Appearance {
                     .map(|stem| stem.to_string())
             })
             .collect();
-        names.sort();
-        names
+        file_names.sort();
+        file_names.dedup();
+        file_names
     }
 }
 
@@ -506,7 +531,7 @@ pub struct App {
     muted_room_ids: HashSet<String>,
     // Currently active appearance color scheme (loaded from the theme file pointed to by the appearance field of preferences.json)
     appearance: Appearance,
-    // Current appearance name ("built_in" when no theme file), used for settings page and /appearance echo
+    // Current appearance name (`Palette::default_name` when the user never picked a theme), used for settings page and /appearance echo
     appearance_name: String,
     // Quick search: in search mode, results appear in loaded messages as you type, no need to press Enter.
     // Enter still retains the full semantics of "load all history for the whole room then search" (pressing every key would page-load the entire history and overwhelm the API).
@@ -623,14 +648,15 @@ pub struct App {
     chat_cache: Option<ChatCache>,
     // Raw avatar bytes: user ID → image bytes, None means "confirmed no avatar or fetch failed".
     // an existing entry means no repeated requests, avoiding repeatedly connecting to the network for the same user every frame; bytes are fetched in the background thread and delivered via
-    // PollingEvent::AvatarLoaded back to the main thread, only one decoding is done during rendering (see avatar_pixels)。
+    // PollingEvent::AvatarLoaded back to the main thread, only one decoding is done during rendering (see avatar_pixels).
     avatar_images: HashMap<String, Option<Vec<u8>>>,
     // Decoded avatar pixel blocks at display size: key is (user ID, column count, row count).
     // the same size is only decoded once (message list uses small blocks, profile card uses large blocks), thereafter looked up directly in the table every frame.
     avatar_pixels: HashMap<(String, usize, usize), AvatarPixels>,
-    // Downloaded and verified new version: (new version number, local package path). Consumed by /update and the settings item "update client"
-    pending_update: Option<(String, PathBuf)>,
-    // /update has arranged a background installation process waiting for this process to exit, the main loop exits immediately upon detecting this flag
+    // The update the feed offered and how far it got. Drives both the notice and the
+    // answer from /update or the settings item "update client".
+    pending_update: Option<(ReleasePackage, UpdateStage)>,
+    // A background installer waits for this process to exit; the main loop ends at once
     update_handoff_requested: bool,
     // Whether background version checking and downloading is in progress, to avoid spawning duplicate download threads
     update_check_running: Option<Arc<AtomicBool>>,
@@ -650,10 +676,10 @@ impl Default for App {
             language_strings: HashMap::new(),
             show_uid: false,
             time_with_date: false,
-            sound_enabled: true,
+            sound_enabled: false,
             muted_room_ids: HashSet::new(),
             appearance: Appearance::built_in(),
-            appearance_name: "built_in".to_string(),
+            appearance_name: Palette::default_name().to_string(),
             quick_search: false,
             focus_index: 0,
             notifications: Vec::new(),
@@ -1168,7 +1194,7 @@ impl App {
                         Ok(WebSocketMessage::Text(text)) => {
                             if let Some(event) = parse_websocket_event(text.as_ref(), &tr) {
                                 debug_log(&format!(
-                                    "WS 收到类型: {}",
+                                    "WebSocket received frame type: {}",
                                     text.chars().take(80).collect::<String>()
                                 ));
                                 // If it's a connected event and there's a connected_sender, send a signal to notify connection readiness
@@ -1258,13 +1284,33 @@ impl App {
             PollingEvent::RegisteredUsersUpdated(users) => {
                 self.registered_users = Some(users);
             }
-            PollingEvent::UpdateReady((version, archive_path)) => {
-                self.pending_update = Some((version.clone(), archive_path));
-                self.push_notification(
-                    self.t("update_ready")
-                        .replace("{version}", &version)
-                        .to_string(),
-                );
+            PollingEvent::UpdateAvailable(package) => {
+                let title = self.t("update_available_title");
+                let title = title.replace("{version}", &package.version);
+                let body = self.t("update_available_body");
+                let body = body.replace("{version}", &package.version);
+                let body = body.replace("{package}", &package.file_name);
+                self.pending_update = Some((package, UpdateStage::AwaitingAnswer));
+                self.push_notification(title);
+                self.push_notification(body);
+            }
+            PollingEvent::UpdateUpToDate(version) => {
+                let wording = self.t("update_up_to_date");
+                let wording = wording.replace("{version}", &version);
+                self.push_notification(wording);
+            }
+            PollingEvent::UpdateReady((version, package_path)) => {
+                let mut matched = false;
+                if let Some((package, _)) = self.pending_update.clone()
+                    && package.version == version
+                {
+                    self.pending_update = Some((package, UpdateStage::Package(package_path)));
+                    matched = true;
+                }
+                if !matched {
+                    return;
+                }
+                self.start_downloaded_update();
             }
             PollingEvent::WebSocketConnected => {
                 self.update_connection_state(true);
@@ -1487,6 +1533,9 @@ impl App {
                     self.sender_names.insert(user_id, username);
                 }
             }
+            // The file picker is a graphical-end feature; the terminal end has no
+            // dialog, so the event exists on the channel but carries no behavior.
+            PollingEvent::AvatarFileChosen(_) => {}
             PollingEvent::QuitCleanupFinished => {
                 self.quit_ready = true;
             }
@@ -1494,7 +1543,9 @@ impl App {
                 // Client-made auth failure sentinel (token expired/invalid): clear the session and return to the logged-out chat page.
                 // Place before other categories to avoid being misreported as a displayable error.
                 if error == websocket_auth_sentinel() {
-                    debug_log("WebSocket 认证失败，清除保存的会话并回到未登录聊天页");
+                    debug_log(
+                        "WebSocket authentication failed, clearing the saved session and returning to the signed-out chat page",
+                    );
                     Self::clear_saved_session();
                     self.current_user_id = None;
                     self.focus_index = 0;
@@ -1603,17 +1654,21 @@ impl App {
     fn handle_encrypt_invitation(&mut self, handshake: EncryptHandshakeData) {
         // The server broadcasts the invitation to all room members, inviter_id equal to self is the echo of its own request
         if Some(&handshake.peer_id) == self.current_user_id.as_ref() {
-            debug_log("invitation 早退：自身回声");
+            debug_log("invitation early exit: our own echo");
             return;
         }
         // When a valid peer invitation arrives, the old session on this side waiting for acceptance indicates both sides initiated simultaneously (role reversal),
         // discard the old session and take the acceptance flow; if already active or negotiating, ignore duplicate invitations
         if let Some(existing) = self.crypto.sessions.get(&handshake.room_id) {
             if existing.phase != EncryptionPhase::AwaitingAcceptance {
-                debug_log("invitation 早退：已有非等待接受会话");
+                debug_log(
+                    "invitation early exit: a session already exists that is not waiting for acceptance",
+                );
                 return;
             }
-            debug_log("invitation 角色反转：丢弃旧会话改走接受方");
+            debug_log(
+                "invitation role flipped: dropping the old session and taking the accepter path",
+            );
             self.crypto.sessions.remove(&handshake.room_id);
         }
         if !crypto::verify_handshake_signature(
@@ -1621,7 +1676,7 @@ impl App {
             &handshake.public_key,
             &handshake.signature,
         ) {
-            debug_log("invitation 早退：签名校验失败");
+            debug_log("invitation early exit: signature verification failed");
             self.push_error(self.t("error_invitation_signature_invalid"));
             return;
         }
@@ -1707,11 +1762,11 @@ impl App {
                 .crypto
                 .sessions
                 .get_mut(&handshake.room_id)
-                .expect("会话存在性已在上方校验");
+                .expect("session presence verified above");
             let ephemeral_secret = session
                 .ephemeral_secret
                 .take()
-                .expect("等待接受阶段的会话必然持有临时私钥");
+                .expect("a session awaiting acceptance must hold its temporary private key");
             match crypto::derive_shared_key(ephemeral_secret, &handshake.public_key) {
                 Ok(key) => key,
                 Err(e) => {
@@ -1727,7 +1782,7 @@ impl App {
             .crypto
             .sessions
             .get_mut(&handshake.room_id)
-            .expect("会话存在性已在上方校验");
+            .expect("session presence verified above");
         session.shared_key = Some(shared_key);
         session.phase = EncryptionPhase::AwaitingSessionReady;
         session.initiated_at = Instant::now();
@@ -1849,7 +1904,7 @@ impl App {
             }
         };
         debug_log(&format!(
-            "initiate room={room_id} public_key前8={}",
+            "initiate room={room_id} first eight characters of the public key {}",
             &public_key[..8.min(public_key.len())]
         ));
         self.send_encrypt_request(room_id, &public_key, &identity_key, &signature);
@@ -1938,7 +1993,9 @@ impl App {
         if self.websocket_token.is_some()
             && self.websocket_connected_at.elapsed() >= version.subscription_refresh_interval()
         {
-            debug_log("tick 触发定期 WebSocket 重连刷新房间订阅");
+            debug_log(
+                "tick triggered the periodic WebSocket reconnect to refresh room subscriptions",
+            );
             self.restart_websocket_thread();
             self.websocket_connected_at = Instant::now();
         }
@@ -1955,7 +2012,7 @@ impl App {
             .map(|(room_id, _)| room_id.clone())
             .collect();
         for room_id in stale_room_ids {
-            debug_log(&format!("tick 触发重发 room={room_id}"));
+            debug_log(&format!("tick triggered a re-send for room={room_id}"));
             self.resend_handshake_if_needed(&room_id);
         }
 
@@ -2155,7 +2212,7 @@ impl App {
             self.sound_enabled = v
                 .get("sound_enabled")
                 .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true);
+                .unwrap_or(false);
             self.quick_search = v
                 .get("quick_search")
                 .and_then(serde_json::Value::as_bool)
@@ -2267,10 +2324,13 @@ impl App {
     /// Send a system notification (if enabled)
     fn send_system_notification(&self, title: &str, body: &str) {
         if !self.sound_enabled {
-            debug_log("系统通知已禁用 (sound_enabled=false)");
+            debug_log("desktop notification disabled (sound_enabled=false)");
             return;
         }
-        debug_log(&format!("发送系统通知: title={}, body={}", title, body));
+        debug_log(&format!(
+            "sending desktop notification: title={}, body={}",
+            title, body
+        ));
 
         // Play the notification sound on a background thread to avoid blocking the main thread
         let sound_enabled = self.sound_enabled;
@@ -2289,16 +2349,22 @@ impl App {
                 {
                     Ok(status) => {
                         if status.success() {
-                            debug_log(&format!("afplay 播放成功: {}", SOUND_FILE));
+                            debug_log(&format!(
+                                "afplay played the sound successfully: {}",
+                                SOUND_FILE
+                            ));
                         } else {
-                            debug_log(&format!("afplay 退出码非零: {:?}", status));
+                            debug_log(&format!("afplay exited with a non-zero code: {:?}", status));
                             // Fall back to terminal bell
                             let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\x07");
                             let _ = std::io::Write::flush(&mut std::io::stderr());
                         }
                     }
                     Err(e) => {
-                        debug_log(&format!("afplay 启动失败: {:?}，回退到 terminal bell", e));
+                        debug_log(&format!(
+                            "afplay failed to start: {:?}, falling back to the terminal bell",
+                            e
+                        ));
                         let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\x07");
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                     }
@@ -2308,10 +2374,10 @@ impl App {
             #[cfg(not(target_os = "macos"))]
             {
                 if let Err(e) = std::io::Write::write_all(&mut std::io::stderr(), b"\x07") {
-                    debug_log(&format!("terminal bell 写入失败: {e}"));
+                    debug_log(&format!("terminal bell write failed: {e}"));
                 }
                 if let Err(e) = std::io::Write::flush(&mut std::io::stderr()) {
-                    debug_log(&format!("terminal bell 刷新失败: {e}"));
+                    debug_log(&format!("terminal bell flush failed: {e}"));
                 }
             }
         });
@@ -2334,9 +2400,14 @@ impl App {
                     .arg(&script)
                     .status()
                 {
-                    Ok(status) if status.success() => debug_log("osascript 桌面通知已发送"),
-                    Ok(status) => debug_log(&format!("osascript 通知失败，退出码 {:?}", status)),
-                    Err(e) => debug_log(&format!("osascript 启动失败: {e}")),
+                    Ok(status) if status.success() => {
+                        debug_log("osascript desktop notification sent")
+                    }
+                    Ok(status) => debug_log(&format!(
+                        "osascript notification failed with exit code {:?}",
+                        status
+                    )),
+                    Err(e) => debug_log(&format!("osascript failed to start: {e}")),
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -2347,7 +2418,7 @@ impl App {
                     .appname("Baihua Client")
                     .show()
                 {
-                    debug_log(&format!("桌面通知发送失败: {e}"));
+                    debug_log(&format!("desktop notification failed: {e}"));
                 }
             }
         });
@@ -2427,17 +2498,17 @@ impl App {
             return false;
         };
         debug_log(&format!(
-            "=== JWT AUTO-LOGIN START: token前8={} ===",
+            "=== token automatic login start: first eight characters of the token {} ===",
             &token[..8.min(token.len())]
         ));
         self.connector.set_token(&token);
         if self.connector.list_rooms().is_err() {
-            debug_log("JWT AUTO-LOGIN: list_rooms 失败，清除会话");
+            debug_log("token automatic login: list_rooms failed, clearing the session");
             Self::clear_saved_session();
             return false;
         }
         self.update_connection_state(true);
-        debug_log("JWT AUTO-LOGIN: list_rooms 成功，设置用户状态");
+        debug_log("token automatic login: list_rooms succeeded, applying the user state");
         // Auto-login also probes the server version immediately (token is set), so subsequent online decisions match the real version
         self.detect_and_apply_api_version();
         self.current_user_id = Some(user_id.clone());
@@ -3190,13 +3261,17 @@ impl App {
     fn detect_and_apply_api_version(&mut self) {
         match self.connector.probe_version() {
             Ok((version, raw)) => {
-                debug_log(&format!("探测服务端版本: raw={raw} parsed={version:?}"));
+                debug_log(&format!(
+                    "probing the server version: raw={raw} parsed={version:?}"
+                ));
                 if version == ApiVersion::Unknown {
                     self.push_notification(format!("{}: {raw}", self.t("api_version_unknown")));
                 }
             }
             Err(e) => {
-                debug_log(&format!("版本探测失败(保留当前版本): {e}"));
+                debug_log(&format!(
+                    "version probe failed (keeping the current version): {e}"
+                ));
             }
         }
     }
@@ -3228,7 +3303,7 @@ impl App {
         match self.connector.login(req) {
             Ok(data) => {
                 debug_log(&format!(
-                    "=== LOGIN START: user={} token前8={} ===",
+                    "=== login start: user={} first eight characters of the token {} ===",
                     data.user.id,
                     &data.token[..8.min(data.token.len())]
                 ));
@@ -3431,7 +3506,10 @@ impl App {
             // is meaningless — if a large offset remains, it would be clamped to the top and accidentally trigger auto-pull, stopping at a high position.
             // Therefore switching group chats and refreshing the same room uniformly reset to bottom; the user needs to actively scroll up before the offset accumulates again
             self.messages_scroll_from_bottom = 0;
-            debug_log(&format!("整房加载 room={} 滚动偏移归零", room.id));
+            debug_log(&format!(
+                "whole-room load for room={} reset the scroll offset to zero",
+                room.id
+            ));
             // The user is viewing this room, reset its unread message count to zero
             self.unread_counts.remove(&room.id);
             // Messages the local side already holds for this very room. In end-to-end encrypted private chats this copy is the plaintext
@@ -3538,7 +3616,7 @@ impl App {
                 let mut older = data.messages;
                 older.reverse();
                 debug_log(&format!(
-                    "更早消息前插 room={} 数量={} 新游标={:?}",
+                    "older messages prepended for room={}, count={}, new cursor={:?}",
                     room.id,
                     older.len(),
                     data.next_cursor
@@ -3656,7 +3734,7 @@ impl App {
                     .crypto
                     .sessions
                     .get_mut(room_id)
-                    .expect("会话存在性已在上方确认");
+                    .expect("session presence confirmed above");
                 session.pending_content = Some(content);
                 self.push_notification(self.t("error_session_establishing"));
             }
@@ -4349,7 +4427,7 @@ impl App {
                 // because different terminals report Ctrl/Ctrl+Shift+arrow keys very differently (Terminal.app doesn't even distinguish),
                 // only recognizing one combination key would manifest as pressing and having no reaction, only the input box cursor moving.
                 if matches!(key.code, KeyCode::Up | KeyCode::Down) && self.in_search_mode() {
-                    debug_log(&format!("搜索切换匹配项: {key:?}"));
+                    debug_log(&format!("search stepped to another match: {key:?}"));
                     self.navigate_search_result(key.code == KeyCode::Up);
                     return false;
                 }
@@ -4358,7 +4436,7 @@ impl App {
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.full_repaint_requested = true;
-                    debug_log("Ctrl+L 请求整屏重绘");
+                    debug_log("the L shortcut requested a full redraw");
                     return false;
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -4466,7 +4544,9 @@ impl App {
                         // pile up in the system queue, after loading completes they're processed late, pushing the new room view "automatically" up and
                         // may accidentally trigger top-pull; within the quiet window after loading completes, mouse events are all discarded to eliminate these late inputs
                         if self.messages_reloaded_at.elapsed() < Duration::from_millis(500) {
-                            debug_log("整房加载后静默窗口内丢弃迟到的滚轮事件");
+                            debug_log(
+                                "wheel events arriving inside the quiet window after a whole-room load are dropped",
+                            );
                             return false;
                         }
                         let scroll_step = 3u16;
@@ -4478,7 +4558,7 @@ impl App {
                                 self.messages_scroll_from_bottom.saturating_sub(scroll_step);
                         }
                         debug_log(&format!(
-                            "滚轮 {:?} 后 offset={}",
+                            "after wheel event {:?} the offset={}",
                             mouse.kind, self.messages_scroll_from_bottom
                         ));
                     }
@@ -4910,7 +4990,6 @@ impl App {
                     .trim()
                     .to_string();
                 if argument.is_empty() {
-                    self.push_notification(self.t("error_add_member_usage"));
                     return false;
                 }
                 // Get the currently selected room
@@ -5678,7 +5757,7 @@ impl App {
                 &mut self
                     .active_form
                     .as_mut()
-                    .expect("表单浮层显示期间表单必定存在")
+                    .expect("while the form overlay is showing the form must exist")
                     .1[index]
                     .state,
             );
@@ -5750,7 +5829,7 @@ impl App {
                 &mut self
                     .active_form
                     .as_mut()
-                    .expect("表单浮层显示期间表单必定存在")
+                    .expect("while the form overlay is showing the form must exist")
                     .1[index]
                     .state,
             );
@@ -6319,7 +6398,7 @@ impl App {
             && !scrolled_to_match
         {
             debug_log(&format!(
-                "触顶自动拉取 room={selected_room_id:?} offset={}",
+                "reached the top, auto-pulling room={selected_room_id:?} offset={}",
                 self.messages_scroll_from_bottom
             ));
             self.load_older_messages();
@@ -6600,7 +6679,7 @@ impl App {
             return;
         }
         debug_log(&format!(
-            "全量历史合并 room={} 新增={} 总计={}",
+            "full history merged for room={}, added={}, total={}",
             room.id,
             fresh.len(),
             self.messages.len() + fresh.len()
@@ -7100,7 +7179,7 @@ impl App {
                 .filter(|request| request.status.as_deref() == Some("pending"))
                 .count();
         let update_suffix = match self.pending_update.as_ref() {
-            Some((version, _)) => format!(" ({version})"),
+            Some((package, _)) => format!(" ({})", package.version),
             None => String::new(),
         };
         vec![
@@ -7643,7 +7722,8 @@ impl App {
             );
             // Names and status themselves may be wider than the body area: if it doesn't fit, let it take several rows alone first, the body continues on the next row,
             // Otherwise the entire invitation would be clipped and invisible
-            let label_text = format!("{peer_name}{status_suffix}：");
+            // The label ends in a colon; a plain ASCII one keeps the overlay language-neutral
+            let label_text = format!("{peer_name}{status_suffix}:");
             let label_width = usize::from(display_width(&label_text));
             let label_pieces: Vec<String> = if label_width > body_width {
                 wrap_by_display_width(&label_text, body_width as u16)
@@ -7859,7 +7939,7 @@ impl App {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    // Core library version: evolves independently of the client version; the top bar and `--version` both report it for easier problem location。
+    // Core library version: evolves independently of the client version; the top bar and `--version` both report it for easier problem location.
     pub fn core_version() -> String {
         baihua_core::core_version().to_string()
     }
@@ -7896,7 +7976,7 @@ impl App {
                 self.update_connection_state(true);
             }
             Err(error) => {
-                debug_log(&format!("启动探测失败: {error}"));
+                debug_log(&format!("startup probe failed: {error}"));
                 self.connector.clear_server_version();
                 self.update_connection_state(false);
             }
@@ -7929,7 +8009,7 @@ impl App {
                 }
                 // Report on first success and on the second consecutive failure; a single intermediate jitter does not disturb the interface
                 if reachable || failed_in_a_row == 2 {
-                    debug_log(&format!("服务端可达性探测: {reachable}"));
+                    debug_log(&format!("server reachability probe: {reachable}"));
                     if sender
                         .send(PollingEvent::ReachabilityChanged(reachable))
                         .is_err()
@@ -7942,9 +8022,28 @@ impl App {
         });
     }
 
-    // Background check for new versions: when a new version is found, download and verify; only pop a notification when the package is really retrieved locally —
-    // the notification appearing means "now /update can be done immediately"; there will be no situation where a prompt appears but you still have to wait for download.
-    // If the check fails (no network, release page redesigned, no package for this platform) just log a debug message, do not disturb the user.
+    /// Download the offered package on a background thread: the terminal must stay drawn
+    /// while the bytes arrive, and the answer comes back as UpdateReady.
+    pub fn start_update_download_thread(&mut self) {
+        let Some((package, UpdateStage::AwaitingAnswer)) = self.pending_update.clone() else {
+            return;
+        };
+        let Some(sender) = self.polling_sender.clone() else {
+            return;
+        };
+        self.pending_update = Some((package.clone(), UpdateStage::Downloading));
+        let wording = self.t("update_downloading");
+        self.push_notification(wording.replace("{version}", &package.version).to_string());
+        thread::spawn(move || {
+            let event = match download_package(&package) {
+                Ok(package_path) => PollingEvent::UpdateReady((package.version, package_path)),
+                Err(error) => PollingEvent::Error(error.to_string()),
+            };
+            let _ = sender.send(event);
+        });
+    }
+    // Background version check: it only asks the release feed and reports the answer as an
+    // event; the notice it opens is what asks the user before anything is downloaded.
     pub fn start_update_check_thread(&mut self, current_version: String) {
         let Some(sender) = self.polling_sender.clone() else {
             return;
@@ -7960,26 +8059,20 @@ impl App {
         let running_flag = Arc::new(AtomicBool::new(true));
         self.update_check_running = Some(running_flag.clone());
         thread::spawn(move || {
-            match check_for_update(&current_version, ReleaseChannel::Terminal) {
-                UpdateCheck::Available(package) => {
-                    debug_log(&format!("发现新版本 {}，开始下载", package.version));
-                    match download_package(&package) {
-                        Ok(archive_path) => {
-                            let _ = sender
-                                .send(PollingEvent::UpdateReady((package.version, archive_path)));
-                        }
-                        Err(error) => debug_log(&format!("新版本下载或校验失败: {error}")),
-                    }
+            let event = match check_for_update(&current_version, ReleaseChannel::Terminal) {
+                UpdateCheck::Available(package) => Some(PollingEvent::UpdateAvailable(package)),
+                UpdateCheck::UpToDate { .. } => {
+                    debug_log("the client is already on the newest release");
+                    Some(PollingEvent::UpdateUpToDate(current_version))
                 }
-                UpdateCheck::UpToDate {
-                    newest_tag,
-                    newest_assets,
-                } => debug_log(&format!(
-                    "客户端已是最新版本（发布页最新标签 {newest_tag}，附件 {newest_assets:?}）"
-                )),
-                UpdateCheck::Unavailable(reason) => debug_log(&format!("版本检查未完成: {reason}")),
+                UpdateCheck::Unavailable(reason) => {
+                    debug_log(&format!("the version check did not finish: {reason}"));
+                    None
+                }
+            };
+            if let Some(event) = event {
+                let _ = sender.send(event);
             }
-            // Only set the flag when both check and download are complete; repeatedly pressing /update during this time will not spawn a second download thread
             running_flag.store(false, Ordering::Relaxed);
         });
     }
@@ -8201,7 +8294,7 @@ impl App {
         }
     }
 
-    /// Change password: old password, new password, confirm new password。
+    /// Change password: old password, new password, confirm new password.
     /// The server password change invalidates all previously issued tokens, so after success the local session must be cleared and the user must re-login.
     fn submit_password_change(&mut self, fields: &[FormField]) {
         let text_of = |index: usize| fields.get(index).map(FormField::text).unwrap_or_default();
@@ -8362,7 +8455,7 @@ impl App {
             Ok(users) => {
                 let _ = sender.send(PollingEvent::RegisteredUsersUpdated(users));
             }
-            Err(error) => debug_log(&format!("拉取用户目录失败: {error}")),
+            Err(error) => debug_log(&format!("fetching the user directory failed: {error}")),
         });
     }
 
@@ -8491,48 +8584,50 @@ impl App {
         }
     }
 
-    // /update: for the settings item "update client", arrange replacement with the already-downloaded and verified update package, this process exits subsequently,
-    // yielding to the installation process. The installation process waits for this process number to disappear before touching files, avoiding on Windows
-    // "the executable file being occupied cannot be overwritten".
-    /// Cannot do a synchronous download here while the package has not arrived — downloading would occupy the entire interface thread,
-    /// so instead dispatch one more background check; after retrieval, pop the notification as normal and the user can execute later.
+    /// The single answer to `/update` and the settings row "update client": the stage of
+    /// the offer decides what happens. Nothing is replaced while this process runs; the
+    /// detached installer waits for this process id before touching files, which is what
+    /// lets Windows overwrite the executable it was started from.
     fn start_downloaded_update(&mut self) -> bool {
-        let Some((version, archive_path)) = self.pending_update.clone() else {
+        let Some((package, stage)) = self.pending_update.clone() else {
             self.start_update_check_thread(Self::client_version());
             self.push_notification(self.t("update_not_ready"));
             return false;
         };
-        let staged_directory = match paths::update_directory() {
-            Some(directory) => directory.join(format!("staged-{version}")),
-            None => {
-                self.push_error(self.t("error_update_directory_unavailable"));
-                return false;
-            }
-        };
-        if let Err(error) = installer::extract_archive(&archive_path, &staged_directory) {
-            self.push_error(format!(
-                "{}: {error}",
-                self.t("error_update_extract_failed")
-            ));
-            return false;
-        }
-        let Some(prefix) = installer::current_prefix() else {
-            self.push_error(self.t("error_update_prefix_unavailable"));
-            return false;
-        };
-        let request = installer::InstallRequest {
-            source_directory: staged_directory,
-            prefix,
-            wait_for_process: Some(std::process::id()),
-        };
-        match installer::spawn_detached_installer(&request) {
-            Ok(()) => {
-                self.update_handoff_requested = true;
-                true
-            }
-            Err(error) => {
-                self.push_error(format!("{}: {error}", self.t("error_update_start_failed")));
+        match stage {
+            UpdateStage::AwaitingAnswer => {
+                self.start_update_download_thread();
                 false
+            }
+            UpdateStage::Downloading => {
+                let wording = self.t("update_downloading");
+                let wording = wording.replace("{version}", &package.version);
+                self.push_notification(wording);
+                false
+            }
+            UpdateStage::Package(package_path) => {
+                let Some(prefix) = installer::current_prefix() else {
+                    self.push_error(self.t("error_update_prefix_unavailable"));
+                    return false;
+                };
+                let handoff = installer::PendingInstall {
+                    package_path: package_path.to_string_lossy().to_string(),
+                    version: package.version.clone(),
+                    prefix: prefix.to_string_lossy().to_string(),
+                    wait_for_process: Some(std::process::id()),
+                };
+                match installer::spawn_detached_installer(&handoff) {
+                    Ok(()) => {
+                        self.pending_update = None;
+                        self.update_handoff_requested = true;
+                        true
+                    }
+                    Err(error) => {
+                        let wording = self.t("error_update_start_failed");
+                        self.push_error(format!("{wording}: {error}"));
+                        false
+                    }
+                }
             }
         }
     }
@@ -8647,7 +8742,8 @@ mod tests {
             find_keyword_positions("Baihua CHAT chat", "chat"),
             vec![(7usize, 11usize), (12usize, 16usize)]
         );
-        // Chinese keywords return by character index, unaffected by UTF-8 byte length
+        // Non-ASCII keywords must return by character index, unaffected by UTF-8 byte
+        // length, so the fixture deliberately keeps its original script (measurement data)
         assert_eq!(
             find_keyword_positions("你好，世界。世界！", "世界"),
             vec![(3usize, 5usize), (6usize, 8usize)]
@@ -8701,6 +8797,8 @@ mod tests {
 
     #[test]
     fn wrapping_respects_display_width_for_wide_characters() {
+        // The Han characters here are the measurement fixture itself (each must occupy two
+        // terminal columns), not user-facing text, so they deliberately stay Chinese.
         let segments = vec![("你好世界".to_string(), Style::default())];
         // Each Chinese character takes two columns; width 4 can only fit two characters
         let lines = wrap_styled_segments(&segments, 4);
@@ -8751,16 +8849,19 @@ mod tests {
     fn every_shipped_theme_is_field_complete_and_well_formatted() {
         // Every theme file shipped with the repository must have complete fields and no extra keys, otherwise it indicates the theme spec is disconnected from the code
         let names = Appearance::available_names();
-        assert!(!names.is_empty(), "config/themes 下应至少有一个外观文件");
+        assert!(
+            !names.is_empty(),
+            "config/themes must ship at least one appearance file"
+        );
         for name in names {
             let (_appearance, has_missing_field, extra_fields) = Appearance::load(&name);
             assert!(
                 !has_missing_field,
-                "config/themes/{name}.json 缺少外观槽位，需补齐或同步 Appearance 字段"
+                "config/themes/{name}.json lacks appearance slots; complete it or sync the Appearance fields"
             );
             assert!(
                 extra_fields.is_empty(),
-                "config/themes/{name}.json 含未知字段: {extra_fields:?}"
+                "config/themes/{name}.json carries unknown fields: {extra_fields:?}"
             );
         }
         // default.json is a mirror of the built-in colors; the two must not drift
@@ -8791,7 +8892,7 @@ mod tests {
         app.current_user_id = Some("user-self".to_string());
         app.rooms = vec![RoomInfo {
             id: "room-one".to_string(),
-            name: Some("群聊一号".to_string()),
+            name: Some("group room one".to_string()),
             is_group: true,
             created_by: "user-self".to_string(),
             members: vec!["user-self".to_string(), "user-other".to_string()],
@@ -8827,7 +8928,10 @@ mod tests {
         let (connection_label, mark, user_text, right) = app.status_bar_texts();
         assert_eq!(mark, "○");
         assert_eq!(connection_label, app.t("bar_connection"));
-        assert!(user_text.is_empty(), "未登录不该显示当前用户");
+        assert!(
+            user_text.is_empty(),
+            "signed out the current user must not be shown"
+        );
         assert!(!right.contains(&app.t("bar_server_version")));
         assert!(right.contains(&app.t("bar_client_version")));
         assert!(right.contains(&App::client_version()));
@@ -8848,11 +8952,11 @@ mod tests {
         let assembled = format!("{label} {mark}{user_text}");
         assert!(
             assembled.find(&app.t("bar_connection")).unwrap() < assembled.find("●").unwrap(),
-            "圆点必须紧跟在连接标签之后，不能被用户名推到行尾"
+            "the dot must sit right after the connection label and never be pushed to the line end by the user name"
         );
         assert!(
-            assembled.contains("●  |  当前用户 alice"),
-            "实际拼接: {assembled}"
+            assembled.contains(&format!("●  |  {} alice", app.t("bar_current_user"))),
+            "the assembled line: {assembled}"
         );
     }
 
@@ -8866,7 +8970,7 @@ mod tests {
         app.handle_message_input_changed();
         assert!(
             app.search_result.is_none(),
-            "改动关键词后应丢弃上次搜索结果"
+            "changing the keyword must discard the previous search results"
         );
         assert!(app.pending_scroll_message_id.is_none());
         // The title returns to "search mode", showing neither old progress nor "not found"
@@ -8886,14 +8990,17 @@ mod tests {
         app.quick_search = true;
         app.input_collector.message_input_state.set_text("#hel");
         app.handle_message_input_changed();
-        let early = app.search_result.clone().expect("快速搜索应即时给出结果");
+        let early = app
+            .search_result
+            .clone()
+            .expect("quick search must answer immediately");
         assert_eq!(early.1, vec!["message-1".to_string()]);
         app.input_collector.message_input_state.set_text("#hello");
         app.handle_message_input_changed();
         let refined = app
             .search_result
             .clone()
-            .expect("改关键词后应重扫而不是清空");
+            .expect("changing the keyword must rescan rather than clear");
         assert_eq!(refined.0, "hello".to_string());
     }
 
@@ -8902,7 +9009,10 @@ mod tests {
         let mut app = chat_page_app_for_render("default");
         // Ten items of 60-column text; on small screens the old algorithm would calculate a height exceeding the screen, causing the whole item to not be drawn
         let long_body = (0..10)
-            .map(|index| format!("{index} 一六〇列宽的长文本占位。").repeat(4))
+            .map(|index| {
+                format!("{index} a placeholder line long enough to flood a 160 column popup. ")
+                    .repeat(4)
+            })
             .collect::<Vec<String>>()
             .join("\n");
         app.push_notification(long_body.clone());
@@ -8911,7 +9021,7 @@ mod tests {
         let visible_head: String = first_line.chars().take(6).collect();
         assert!(
             buffer_contains(&buffer, &visible_head),
-            "提示框在小屏幕上被整体丢弃了，长文本没能自适应"
+            "the notice was dropped whole on the small screen; long texts must adapt"
         );
     }
 
@@ -8929,16 +9039,16 @@ mod tests {
         ] {
             assert!(
                 labels.iter().any(|label| label.contains(&app.t(key))),
-                "设置菜单缺少条目 {key}"
+                "the settings menu lacks the entry {key}"
             );
         }
         let delete_entry = entries
             .iter()
             .find(|(label, _, _)| label.contains(&app.t("option_delete_account")))
-            .expect("应有删除账户条目");
+            .expect("the delete-account entry must exist");
         assert_eq!(
             delete_entry.1, app.appearance.notice_error_border,
-            "删除账户必须用报错色显示"
+            "delete-account must be drawn in the error color"
         );
         assert_eq!(
             delete_entry.2,
@@ -8947,7 +9057,7 @@ mod tests {
         // Every item needs a label: dispatch reads directly from this table; there are no longer any index constants needing alignment
         assert!(
             entries.iter().all(|(label, _, _)| !label.trim().is_empty()),
-            "菜单项标签不该为空"
+            "a menu entry label must not be empty"
         );
     }
 
@@ -8956,7 +9066,7 @@ mod tests {
         let mut app = chat_page_app_for_render("default");
         app.pending_requests = vec![RoomRequestInfo {
             id: "request-in".to_string(),
-            message: "加个好友".to_string(),
+            message: "let us be friends".to_string(),
             is_encrypted: false,
             created_at: String::new(),
             sender: Some(baihua_core::api::RoomRequestPeer {
@@ -8969,7 +9079,7 @@ mod tests {
         }];
         app.sent_requests = vec![RoomRequestInfo {
             id: "request-out".to_string(),
-            message: "你好".to_string(),
+            message: "hello".to_string(),
             is_encrypted: false,
             created_at: String::new(),
             sender: None,
@@ -8998,7 +9108,7 @@ mod tests {
     fn invitation_with_status(id: &str, status: Option<&str>) -> RoomRequestInfo {
         RoomRequestInfo {
             id: id.to_string(),
-            message: "加个好友".to_string(),
+            message: "let us be friends".to_string(),
             is_encrypted: false,
             created_at: String::new(),
             sender: Some(baihua_core::api::RoomRequestPeer {
@@ -9035,13 +9145,13 @@ mod tests {
             .settings_menu_entries()
             .iter()
             .find(|(label, _, _)| label.contains(&app.t("option_pending_requests")))
-            .expect("设置菜单应有私聊请求管理条目")
+            .expect("the settings menu must carry the private-chat request manager entry")
             .0
             .clone();
         assert_eq!(
             label,
             format!(" {} (3)", app.t("option_pending_requests")),
-            "数字提示只该算两条收到的加一条仍在等的"
+            "the badge must count only two received plus one still pending"
         );
     }
 
@@ -9055,7 +9165,7 @@ mod tests {
         assert!(buffer_contains(&buffer, &app.t("request_status_declined")));
         assert!(
             !buffer_contains(&buffer, &app.t("request_status_cancelled")),
-            "被拒绝的邀请不能显示成已撤回"
+            "a declined invitation must not read as withdrawn"
         );
     }
 
@@ -9075,12 +9185,12 @@ mod tests {
         assert_eq!(
             app.pending_requests.len(),
             2,
-            "已处理的邀请不能从历史里消失"
+            "handled invitations must not vanish from the history"
         );
         assert_eq!(
             app.pending_requests[0].status.as_deref(),
             Some("accepted"),
-            "结果状态要就地记上，否则看上去还是待处理"
+            "the outcome must be recorded in place or the row still looks pending"
         );
         assert_eq!(app.request_entries().len(), 3);
         app.mark_pending_request_handled("received-2", "declined");
@@ -9089,7 +9199,7 @@ mod tests {
         assert_eq!(
             app.sent_requests[0].status.as_deref(),
             Some("cancelled"),
-            "撤回后本地状态就要变，否则列表里仍显示待处理"
+            "cancelling must update the local state or the list keeps showing pending"
         );
     }
 
@@ -9118,7 +9228,7 @@ mod tests {
                 .find(|request| request.id == "handled")
                 .and_then(|request| request.status.as_deref()),
             Some("accepted"),
-            "合并轮询结果时不能把本端记的结果状态冲掉"
+            "merging polled results must not wipe the outcome this end recorded"
         );
         // When the same entry appears in both sources, the server's version takes precedence; do not list it twice
         app.apply_received_requests(vec![invitation_with_status("handled", None)]);
@@ -9158,18 +9268,24 @@ mod tests {
         // The panel rectangle is calculated with the same algorithm as production code, so only the column interval within the panel can be taken:
         // Concatenating the whole row would mix in the chat page text from both sides of the panel, so wrapped entries can never match
         let (panel_rect, body_width) = overlay_list_panel(&labels, Rect::new(0, 1, 26, 63));
-        assert!(panel_rect.width <= 26, "面板不该比屏幕还宽");
+        assert!(
+            panel_rect.width <= 26,
+            "the panel must not be wider than the screen"
+        );
         let inside = panel_body_text(&buffer, panel_rect);
         for label in &labels {
             let compact: String = label
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect();
-            assert!(inside.contains(&compact), "设置菜单条目被裁掉: {label}");
+            assert!(
+                inside.contains(&compact),
+                "the settings menu entry was clipped: {label}"
+            );
         }
         assert!(
             labels.iter().any(|label| display_width(label) > body_width),
-            "这份数据本该窄到需要折行，否则测不到折行分支"
+            "this fixture must be narrow enough to require wrapping, otherwise the wrap branch goes untested"
         );
     }
 
@@ -9195,7 +9311,7 @@ mod tests {
         let buffer = render_snapshot(&mut app, 56, 20);
         assert!(
             buffer_contains(&buffer, &tail_of(&app.t("hint_pending_requests"), 8)),
-            "私聊请求浮层的底部提示被右边界裁掉了"
+            "the footer hint of the request overlay was clipped by the right edge"
         );
 
         app.open_form(
@@ -9209,7 +9325,7 @@ mod tests {
         let narrow = render_snapshot(&mut app, 40, 20);
         assert!(
             buffer_contains(&narrow, &tail_of(&app.t("form_password_hint"), 8)),
-            "改密表单的底部提示在 40 列面板里被裁掉了"
+            "the password form footer was clipped inside the 40-column panel"
         );
     }
 
@@ -9220,16 +9336,25 @@ mod tests {
         app.current_username = "buitest13".to_string();
         // Version info is secondary: when one row does not fit, let it be clipped first; the connection marker and current user must stay
         let buffer = render_snapshot(&mut app, 56, 20);
-        assert!(buffer_contains(&buffer, "连接 ●"), "窄屏把连接标记挤掉了");
         assert!(
-            buffer_contains(&buffer, &format!("当前用户 {}", app.current_username)),
-            "窄屏把当前用户挤掉了"
+            buffer_contains(&buffer, &format!("{} ●", app.t("bar_connection"))),
+            "the narrow layout squeezed the connection mark away"
+        );
+        assert!(
+            buffer_contains(
+                &buffer,
+                &format!("{} {}", app.t("bar_current_user"), app.current_username)
+            ),
+            "the narrow layout squeezed the current user away"
         );
         // On wide screens both fit, version info remains complete (server version was never probed, so it does not display anyway)
         let wide = render_snapshot(&mut app, 120, 20);
         assert!(buffer_contains(&wide, &app.t("bar_client_version")));
         assert!(buffer_contains(&wide, &App::client_version()));
-        assert!(buffer_contains(&wide, "当前用户 buitest13"));
+        assert!(buffer_contains(
+            &wide,
+            &format!("{} buitest13", app.t("bar_current_user"))
+        ));
     }
 
     #[test]
@@ -9238,7 +9363,10 @@ mod tests {
         let app = chat_page_app_for_render("default");
         let hint = app.t("form_profile_hint");
         let wrapped = wrapped_hint_text(&hint, Style::default(), 34);
-        assert!(wrapped.lines.len() >= 2, "窄面板里提示应该折行");
+        assert!(
+            wrapped.lines.len() >= 2,
+            "on a narrow panel the hint should wrap"
+        );
         let joined: String = wrapped
             .lines
             .iter()
@@ -9252,14 +9380,17 @@ mod tests {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect();
-        assert_eq!(joined, original, "折行丢了字");
+        assert_eq!(joined, original, "wrapping lost characters");
         for line in &wrapped.lines {
             let plain: String = line
                 .spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect();
-            assert!(display_width(&plain) <= 34, "折出来的行仍超宽: {plain}");
+            assert!(
+                display_width(&plain) <= 34,
+                "a wrapped line still overflows: {plain}"
+            );
         }
     }
 
@@ -9275,7 +9406,7 @@ mod tests {
             .position(|(_, _, action)| {
                 matches!(action, SettingsAction::OpenForm(FormAction::UpdateProfile))
             })
-            .expect("设置菜单应有改资料条目");
+            .expect("the settings menu must carry the edit-profile entry");
         app.menu_list_state.select(Some(profile_index));
         app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Enter,
@@ -9284,7 +9415,7 @@ mod tests {
         assert_eq!(
             app.displaying_overlay,
             DisplayingOverlay::SettingsMenu,
-            "未登录不该切进表单浮层"
+            "signed out the form overlay must not open"
         );
         assert!(app.active_form.is_none());
         assert!(
@@ -9297,7 +9428,7 @@ mod tests {
             .settings_menu_entries()
             .iter()
             .position(|(_, _, action)| matches!(action, SettingsAction::ToggleShowUid))
-            .expect("设置菜单应有显示 UID 开关");
+            .expect("the settings menu must carry the show-user-id switch");
         app.menu_list_state.select(Some(toggle_index));
         let before = app.show_uid;
         app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
@@ -9320,7 +9451,7 @@ mod tests {
         assert_eq!(
             app.active_form.as_ref().map(|(action, _)| action.clone()),
             Some(FormAction::ChangeAvatar),
-            "Ctrl+U 应打开原来的修改头像表单"
+            "the U shortcut must open the original avatar form"
         );
     }
 
@@ -9328,7 +9459,8 @@ mod tests {
     fn avatar_directory_offers_only_uploadable_images() {
         let directory = std::env::temp_dir().join("baihua-avatar-source-listing");
         let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(directory.join("子目录")).expect("临时目录应可创建");
+        fs::create_dir_all(directory.join("a subdirectory"))
+            .expect("the temporary directory must be creatable");
         for name in [
             "me.png",
             "other.JPG",
@@ -9336,7 +9468,7 @@ mod tests {
             "archive.tar.gz",
             "icon.webp",
         ] {
-            fs::write(directory.join(name), b"x").expect("临时文件应可写入");
+            fs::write(directory.join(name), b"x").expect("the temporary file must be writable");
         }
         let names: Vec<String> = avatar_files_in(&directory)
             .into_iter()
@@ -9354,9 +9486,12 @@ mod tests {
         let label = "/profile bobbington";
         let description = "01a070d7-d079-71c0-a254-32706c393476";
         let wide = completion_lines(label, description, Style::default(), Style::default(), 80);
-        assert_eq!(wide.len(), 1, "放得下时不该多占一行");
+        assert_eq!(wide.len(), 1, "when it fits it must not take an extra row");
         let tight = completion_lines(label, description, Style::default(), Style::default(), 24);
-        assert!(tight.len() >= 2, "挤不下时说明要另起一行");
+        assert!(
+            tight.len() >= 2,
+            "when it does not fit the hint must start on its own row"
+        );
         let flattened: String = tight
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -9369,7 +9504,10 @@ mod tests {
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
-        assert_eq!(flattened, expected, "挤不下时说明要完整挪到下一行");
+        assert_eq!(
+            flattened, expected,
+            "when squeezed, the hint must move to the next row whole"
+        );
     }
 
     /// Create bytes for a solid-color PNG: card tests do not depend on asset files in the repository
@@ -9387,14 +9525,18 @@ mod tests {
     fn avatar_grid_keeps_the_square_pixel_ratio_at_every_width() {
         for columns_available in [4u16, 7, 12, 20, 21, 32, 48] {
             let (columns, rows) = avatar_grid_within(columns_available, 30);
-            assert_eq!(columns, rows * 2, "{columns_available} 列可用时比例失真");
+            assert_eq!(
+                columns,
+                rows * 2,
+                "the proportions went wrong with {columns_available} columns available"
+            );
             assert!(
                 columns <= columns_available.max(2),
-                "{columns_available} 列可用时超出宽度"
+                "the width overflowed with {columns_available} columns available"
             );
             assert!(
                 rows <= profile_avatar_cells().1 as u16,
-                "行数不该超过最大网格"
+                "the row count must not exceed the largest grid"
             );
         }
     }
@@ -9407,7 +9549,7 @@ mod tests {
             id: "user-self".to_string(),
             username: "self".to_string(),
             nickname: None,
-            bio: Some("短".to_string()),
+            bio: Some("short".to_string()),
             avatar: Some("/static/avatars/me.png".to_string()),
         });
         app.avatar_images
@@ -9431,12 +9573,12 @@ mod tests {
             }
             assert!(
                 !rows.is_empty(),
-                "{width}x{height} 下没画出头像素块（头像被文字挤掉了）"
+                "no avatar pixels were drawn at {width}x{height} (the text squeezed the avatar away)"
             );
             assert_eq!(
                 columns.len(),
                 rows.len() * 2,
-                "{width}x{height} 下头像被压成 {}×{} 的矩形",
+                "the avatar was squeezed into a {} by {} rectangle at {width}x{height}",
                 columns.len(),
                 rows.len()
             );
@@ -9453,7 +9595,9 @@ mod tests {
         app.profile_view = Some(PublicProfile {
             id: "user-self".to_string(),
             username: "self".to_string(),
-            nickname: Some("长着中文昵称的自己".to_string()),
+            nickname: Some("a rather long nickname of mine".to_string()),
+            // The biography is deliberately a long run of wide CJK characters: the card
+            // wraps cell by cell and this measures that no tail is clipped at that width
             bio: Some("这是一段非常长的个人简介，专门用来验证窄屏下资料卡不会裁掉尾部".to_string()),
             avatar: Some("https://avatar.example.com/users/0123456789abcdef.png".to_string()),
         });
@@ -9461,15 +9605,15 @@ mod tests {
         let buffer = render_snapshot(&mut app, 62, 24);
         assert!(
             buffer_contains(&buffer, "裁掉尾部"),
-            "窄屏下长简介尾部被右边界切掉"
+            "on the narrow layout the biography tail was cut by the right edge"
         );
         assert!(
             buffer_contains(&buffer, "abcdef.png"),
-            "窄屏下长头像链接尾部被右边界切掉"
+            "on the narrow layout the long avatar link tail was cut by the right edge"
         );
         assert!(
             buffer_contains(&buffer, "example.com"),
-            "窄屏下长邮箱尾部被右边界切掉"
+            "on the narrow layout the long email tail was cut by the right edge"
         );
     }
 
@@ -9490,7 +9634,7 @@ mod tests {
         assert!(buffer_contains(&buffer, &app.t("password_confirm_label")));
         assert!(
             !buffer_contains(&buffer, "hunter2"),
-            "密码字段必须以遮蔽字符显示，不能把明文画到屏幕上"
+            "password fields must render as masked characters, never as plaintext on the screen"
         );
         // Label column width takes the widest label; the focus marker only appears on the current item
         assert!(buffer_contains(&buffer, &app.t("form_password_hint")));
@@ -9503,8 +9647,8 @@ mod tests {
         assert_eq!(profile_field_value("   "), None);
         assert_eq!(profile_field_value("-"), Some(Some("-".to_string())));
         assert_eq!(
-            profile_field_value("  新昵称  "),
-            Some(Some("新昵称".to_string()))
+            profile_field_value("  new nickname  "),
+            Some(Some("new nickname".to_string()))
         );
     }
 
@@ -9527,7 +9671,7 @@ mod tests {
             id: "message-secret".to_string(),
             room_id: "room-secret".to_string(),
             sender_id: "user-other".to_string(),
-            content: "只存在于内存里的明文".to_string(),
+            content: "plaintext that only lives in memory".to_string(),
             created_at: "2026-09-06T00:00:00+00:00".to_string(),
         }];
         app.load_messages_for_selected_room();
@@ -9535,8 +9679,8 @@ mod tests {
             app.messages
                 .iter()
                 .any(|message| message.id == "message-secret"
-                    && message.content == "只存在于内存里的明文"),
-            "重新加载同一个加密私聊时，本端解出来的明文不能被整表换掉，实际 {:?}",
+                    && message.content == "plaintext that only lives in memory"),
+            "reloading the same encrypted private chat must not swap local plaintext for the server table, got {:?}",
             app.messages
                 .iter()
                 .map(|message| message.content.clone())
@@ -9550,7 +9694,7 @@ mod tests {
             app.messages
                 .iter()
                 .all(|message| message.room_id == "room-one"),
-            "换房间后上一个房间的内容不得残留，实际 {:?}",
+            "switching rooms must leave no content of the previous room, got {:?}",
             app.messages
                 .iter()
                 .map(|message| message.room_id.clone())
@@ -9571,8 +9715,13 @@ mod tests {
 
         // Unencrypted rooms: after writing the whole room, it can be read back as-is, with a paging cursor returned
         app.cache_loaded_messages("room-one");
-        let cache = app.chat_cache.as_ref().expect("应已建立缓存目录");
-        let cached = cache.load_room("room-one").expect("明聊房间应已落盘");
+        let cache = app
+            .chat_cache
+            .as_ref()
+            .expect("the cache directory must have been created");
+        let cached = cache
+            .load_room("room-one")
+            .expect("the plain room must have been cached");
         assert_eq!(cached.messages.len(), 2);
         assert_eq!(cached.messages[0].id, "message-1");
 
@@ -9590,18 +9739,18 @@ mod tests {
             id: "message-secret".to_string(),
             room_id: "room-secret".to_string(),
             sender_id: "user-other".to_string(),
-            content: "只存在于内存里的明文".to_string(),
+            content: "plaintext that only lives in memory".to_string(),
             created_at: "2026-08-30T08:02:00+00:00".to_string(),
         });
         app.cache_loaded_messages("room-secret");
         assert!(
             cache.load_room("room-secret").is_none(),
-            "加密房间不得写入本地缓存"
+            "an encrypted room must never enter the local cache"
         );
         // When the message list mixes content from two rooms, it is also not allowed to write to disk by room
         assert!(
             cache.load_room("room-one").is_some(),
-            "此前写好的明聊缓存不该被误删"
+            "the earlier plain-room cache must survive untouched"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -9613,17 +9762,23 @@ mod tests {
         let quit = commands
             .iter()
             .find(|(name, _)| *name == "quit")
-            .expect("应有 /quit");
+            .expect("/quit must exist");
         let exit = commands
             .iter()
             .find(|(name, _)| *name == "exit")
-            .expect("应有 /exit 别名");
-        assert_eq!(quit.1, exit.1, "别名必须共用同一条说明文案");
+            .expect("/exit must exist as an alias");
+        assert_eq!(
+            quit.1, exit.1,
+            "the alias must share the very same description text"
+        );
         // When there are no private chats to clean up, the exit flow is immediately ready, which is exactly used to verify that the alias follows the same path
         let mut app = chat_page_app_for_render("default");
         assert!(!app.should_quit_now());
         app.execute_chat_command("/exit");
-        assert!(app.should_quit_now(), "/exit 应像 /quit 一样进入退出流程");
+        assert!(
+            app.should_quit_now(),
+            "/exit must start the quit flow like /quit"
+        );
     }
 
     #[test]
@@ -9631,7 +9786,7 @@ mod tests {
         let names = Appearance::available_names();
         assert!(
             names.iter().any(|name| name == "dark"),
-            "应随仓库提供暗色主题"
+            "the repository must ship the dark theme"
         );
         let (dark, has_missing_field, extra_fields) = Appearance::load("dark");
         assert!(!has_missing_field);
@@ -9642,7 +9797,7 @@ mod tests {
         // Under the dark theme, body text must be brighter than the background, otherwise it is invisible
         assert!(
             theme_luminance(dark.message_text) > theme_luminance(dark.app_background),
-            "暗色主题的正文颜色应明显亮于背景"
+            "the dark theme's body color must be clearly brighter than its background"
         );
     }
 
@@ -9671,7 +9826,10 @@ mod tests {
         app.displaying_overlay = DisplayingOverlay::Form;
         let buffer = render_snapshot(&mut app, 90, 24);
         let body = buffer_row_text(&buffer, 0);
-        assert!(!body.contains("hunter2"), "口令不该出现在屏幕上");
+        assert!(
+            !body.contains("hunter2"),
+            "the password must never reach the screen"
+        );
         // Evidence of a box: there is a top-left corner, and the border is the "unselected" input box border color
         // (the form deliberately does not use selection color, see render_box_field)
         assert!(
@@ -9679,7 +9837,7 @@ mod tests {
                 .content
                 .iter()
                 .any(|cell| cell.symbol() == "┌" && cell.fg == app.appearance.input_border),
-            "少于三个条目的表单应自带方框输入框，且默认不是选中色"
+            "a form with fewer than three entries must ship its own boxed input, not selected by default"
         );
         assert!(buffer_contains(
             &buffer,
@@ -9691,7 +9849,7 @@ mod tests {
     fn request_overlay_shows_the_whole_invitation_message() {
         let mut app = chat_page_app_for_render("default");
         let long_message =
-            "这是一条很长很长的私聊验证消息，用来检验浮层会不会把内容截成一行。".repeat(3);
+            "a very long private-chat verification message used to check whether the overlay clips content into one line.".repeat(3);
         app.pending_requests = vec![RoomRequestInfo {
             id: "request-long".to_string(),
             message: long_message.clone(),
@@ -9707,7 +9865,7 @@ mod tests {
         }];
         app.sent_requests = vec![RoomRequestInfo {
             id: "request-out".to_string(),
-            message: "你好，加个好友".to_string(),
+            message: "hello, let us be friends".to_string(),
             is_encrypted: true,
             created_at: String::new(),
             sender: None,
@@ -9725,7 +9883,7 @@ mod tests {
         let tail: String = tail.chars().rev().collect();
         assert!(
             buffer_contains(&buffer, &tail),
-            "邀请正文被截断，末尾的 {tail:?} 没出现在浮层里"
+            "the invitation body was truncated; its tail {tail:?} never reached the overlay"
         );
         // The one sent by oneself is also there, with encryption markers and status
         assert!(buffer_contains(&buffer, "carol"));
@@ -9760,7 +9918,7 @@ mod tests {
         assert_eq!(
             app.input_collector.message_input_state.text(),
             "/pr",
-            "退出浮层后输入应落回消息输入框"
+            "after leaving the overlay, typing must land back in the message box"
         );
     }
 
@@ -9775,10 +9933,13 @@ mod tests {
         assert_eq!(
             app.input_collector.message_input_state.text(),
             "/login somebody hunter2",
-            "带参数的登录行不该被吃掉"
+            "a login line with an argument must not be swallowed"
         );
         assert_eq!(app.displaying_overlay, DisplayingOverlay::Nothing);
-        assert!(app.notifications.is_empty(), "不该再多一句提示");
+        assert!(
+            app.notifications.is_empty(),
+            "no extra notice should have been pushed"
+        );
         // Only open the login overlay when there are no parameters
         app.input_collector.message_input_state.set_text("/login");
         app.handle_chat_submit();
@@ -9790,7 +9951,7 @@ mod tests {
         fn invitation(status: &str) -> RoomRequestInfo {
             RoomRequestInfo {
                 id: "request-1".to_string(),
-                message: "加个好友".to_string(),
+                message: "let us be friends".to_string(),
                 is_encrypted: false,
                 created_at: String::new(),
                 sender: None,
@@ -9811,16 +9972,19 @@ mod tests {
             .iter()
             .map(|(text, _, _)| text.clone())
             .collect();
-        assert_eq!(notices.len(), 1, "实际通知: {notices:?}");
+        assert_eq!(notices.len(), 1, "actual notices: {notices:?}");
         assert!(
             notices[0].contains("carol"),
-            "通知里要点明是谁拒的: {notices:?}"
+            "the notice must name who declined: {notices:?}"
         );
         // After the local list is updated, another round with the same status should not prompt again
         app.notifications.clear();
         app.sent_requests = vec![invitation("declined")];
         app.announce_declined_invitations(&[invitation("declined")]);
-        assert!(app.notifications.is_empty(), "同一状态变化不该报两次");
+        assert!(
+            app.notifications.is_empty(),
+            "the same state change must not be reported twice"
+        );
     }
 
     #[test]
@@ -9833,7 +9997,7 @@ mod tests {
         app.registered_users = Some(vec![UserSearchResult {
             id: "01a0".to_string(),
             username: "carol".to_string(),
-            nickname: Some("卡尔".to_string()),
+            nickname: Some("Karl".to_string()),
             bio: None,
             avatar: None,
         }]);
@@ -9841,7 +10005,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, "/profile carol");
         assert_eq!(candidates[0].1, "carol - 01a0");
-        assert_eq!(candidates[0].2, "卡尔");
+        assert_eq!(candidates[0].2, "Karl");
         // Continue filtering when a prefix has been entered; do not require matching from the beginning
         assert_eq!(app.completion_candidates("profile ca").len(), 1);
         assert!(app.completion_candidates("profile zz").is_empty());
@@ -9892,7 +10056,7 @@ mod tests {
                     .content
                     .iter()
                     .any(|cell| cell.symbol() == "└" && cell.fg == overlay_border),
-                "{frame_kind:?} 的窗口边框没走外观里的 overlay_border"
+                "the window border for {frame_kind:?} did not use the appearance's overlay_border"
             );
         }
     }
@@ -9900,6 +10064,8 @@ mod tests {
     #[test]
     fn very_long_single_line_notification_is_still_visible_on_a_small_screen() {
         let mut app = chat_page_app_for_render("default");
+        // A run of wide CJK characters so the old whole-notice-drop (which keyed on the
+        // estimated pixel height of the wrapped box) reproduces at this terminal size
         let head = "很长的单行提示内容";
         app.push_notification(format!("{}结尾看得见", head.repeat(12)));
         let buffer = render_snapshot(&mut app, 60, 14);
@@ -9907,7 +10073,7 @@ mod tests {
         // now it sets the width by "the widest row" and estimates height row by row; when it does not fit, it clips the display instead of discarding
         assert!(
             buffer_contains(&buffer, head),
-            "长提示在小屏幕上被整条丢弃，没有自适应宽高"
+            "the long notice was dropped whole on the small screen instead of adapting"
         );
     }
 
@@ -9915,8 +10081,11 @@ mod tests {
     /// When there is no real terminal, this is the only way to verify down to "pixels" (cell symbols and styles).
     fn render_snapshot(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
-        let mut terminal = ratatui::Terminal::new(backend).expect("测试后端应能初始化");
-        terminal.draw(|frame| app.ui(frame)).expect("渲染聊天页");
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("the test backend must initialize");
+        terminal
+            .draw(|frame| app.ui(frame))
+            .expect("rendering the chat page");
         terminal.backend().buffer().clone()
     }
 
@@ -9967,8 +10136,11 @@ mod tests {
     /// cursor points to an older item), the second returns the last page (has_more is false, cursor is empty).
     /// Messages are arranged per server convention "newest first", used to verify the client's stop condition, reversal, deduplication, and merge sorting.
     fn spawn_two_page_message_server() -> std::net::SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地测试端口");
-        let address = listener.local_addr().expect("测试端口应能读回地址");
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding a local test port");
+        let address = listener
+            .local_addr()
+            .expect("the test port must report its address");
         std::thread::spawn(move || {
             for page_index in 0..2usize {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -10015,7 +10187,8 @@ mod tests {
             vec!["oldest-0", "old-1", "old-2", "message-1", "message-2"]
         );
         // The hit list is arranged in display order: four messages containing hello, default positioning at the last match
-        let (keyword, matched, selected) = app.search_result.clone().expect("搜索应已执行");
+        let (keyword, matched, selected) =
+            app.search_result.clone().expect("the search must have run");
         assert_eq!(keyword, "hello");
         assert_eq!(matched, vec!["oldest-0", "old-1", "old-2", "message-1"]);
         assert_eq!(selected, matched.len() - 1);
@@ -10031,7 +10204,7 @@ mod tests {
         let mut app = chat_page_app_for_render("default");
         app.input_collector.message_input_state.set_text("#hello");
         app.execute_message_search();
-        let (keyword, matched, selected) = app.search_result.expect("搜索应已执行");
+        let (keyword, matched, selected) = app.search_result.expect("the search must have run");
         assert_eq!(keyword, "hello");
         assert_eq!(matched, vec!["message-1".to_string()]);
         assert_eq!(selected, 0);
@@ -10128,11 +10301,14 @@ mod tests {
                 .search_result
                 .as_ref()
                 .map(|(_, _, selected)| *selected)
-                .expect("搜索结果应仍在");
-            assert_ne!(before, after, "修饰键 {modifiers:?} 下按 ↓ 未切换匹配项");
+                .expect("the search results must still be there");
+            assert_ne!(
+                before, after,
+                "the down arrow with {modifiers:?} did not step to another match"
+            );
             assert!(
                 app.pending_scroll_message_id.is_some(),
-                "切换后要标记待定位的消息"
+                "stepping must mark the message that needs repositioning"
             );
         }
         // Pressing again on the last match should wrap to the first
@@ -10150,17 +10326,17 @@ mod tests {
     fn pasted_text_with_carriage_returns_yields_clean_new_lines() {
         // Pasted line endings in macOS Terminal.app are \r\n; the \r must not be left in the text buffer
         let mut app = chat_page_app_for_render("default");
-        app.handle_pasted_text("第一行\r\n第二行\r\n第三行");
+        app.handle_pasted_text("line one\r\nline two\r\nline three");
         assert_eq!(
             app.input_collector.message_input_state.text(),
-            "第一行\n第二行\n第三行"
+            "line one\nline two\nline three"
         );
         assert!(
             !app.input_collector
                 .message_input_state
                 .text()
                 .contains('\r'),
-            "粘贴结果里不应残留回车符"
+            "the pasted text must not keep carriage returns"
         );
         // Bare \r (old Mac line ending) converted to newline; other control characters (like bell \u{7}) are discarded directly
         assert_eq!(normalize_pasted_text("a\rb\u{7}c"), "a\nbc");
@@ -10172,11 +10348,11 @@ mod tests {
     fn pasted_multiline_text_goes_into_the_input_box_without_sending() {
         let mut app = chat_page_app_for_render("default");
         let message_count_before = app.messages.len();
-        app.handle_pasted_text("第一行\n第二行\n第三行");
+        app.handle_pasted_text("line one\nline two\nline three");
         // All three rows stay in the input box; newline does not trigger sending
         assert_eq!(
             app.input_collector.message_input_state.text(),
-            "第一行\n第二行\n第三行"
+            "line one\nline two\nline three"
         );
         assert_eq!(app.messages.len(), message_count_before);
     }
@@ -10190,7 +10366,7 @@ mod tests {
         let buffer = render_snapshot(&mut app, 120, 36);
         assert!(
             (0..120u16).all(|column| buffer[(column, 35u16)].symbol() == " "),
-            "最底行应保持空白"
+            "the bottom row must stay blank"
         );
         assert_eq!(app.screen_text_rows.len(), 35);
     }
@@ -10204,7 +10380,7 @@ mod tests {
         let (keyword, matched, selected) = app
             .search_result
             .clone()
-            .expect("快速搜索应随输入立即出结果");
+            .expect("quick search must answer as the text is typed");
         assert_eq!(keyword, "hello");
         assert_eq!(matched, vec!["message-1".to_string()]);
         assert_eq!(selected, 0);
@@ -10236,7 +10412,7 @@ mod tests {
             assert_eq!(
                 app.displaying_overlay,
                 DisplayingOverlay::SettingsMenu,
-                "{overlay:?} 的 Esc 应退回设置菜单"
+                "Esc from {overlay:?} must fall back to the settings menu"
             );
         }
         // Going back one more level from the settings menu is the chat page without overlays
@@ -10256,10 +10432,10 @@ mod tests {
             .count();
         assert!(
             painted_cells > 120 * 36 / 2,
-            "应用背景未铺满整屏，仅 {painted_cells} 个单元格着色"
+            "the application background did not cover the screen; only {painted_cells} cells were painted"
         );
-        // Row 0 is the top bar; the room list top-left corner border starts from row 1 (white under high-contrast)
-        assert_eq!(buffer[(0u16, 1u16)].fg, Color::White);
+        // Row 0 is the top bar; the room list border starts from row 1 (off white under high-contrast)
+        assert_eq!(buffer[(0u16, 1u16)].fg, Color::Rgb(232, 232, 232));
     }
 
     #[test]
@@ -10289,11 +10465,19 @@ mod tests {
         );
         let current_rows = rows_with_background(&buffer, Color::LightRed);
         let other_rows = rows_with_background(&buffer, Color::LightYellow);
-        assert_eq!(current_rows.len(), 1, "只应有一条命中被标成当前色");
-        assert_eq!(other_rows.len(), 1, "只应有一条命中保持普通命中色");
+        assert_eq!(
+            current_rows.len(),
+            1,
+            "exactly one hit may carry the current color"
+        );
+        assert_eq!(
+            other_rows.len(),
+            1,
+            "exactly one hit may keep the ordinary hit color"
+        );
         assert!(
             current_rows[0] < other_rows[0],
-            "当前停在第一条命中，特殊色应出现在更靠上的行"
+            "resting on the first hit, the special color belongs to a row above"
         );
         // Switch to the second match: the two colors swap positions, proving the "current" marker follows the selected item
         app.search_result = Some((
@@ -10311,7 +10495,12 @@ mod tests {
             current_rows
         );
         // The input box title gives the match progress
-        assert!(buffer_contains(&buffer, "搜索模式: 第 1/2 个匹配项"));
+        assert!(buffer_contains(
+            &buffer,
+            &app.t("search_progress")
+                .replace("{current}", "1")
+                .replace("{total}", "2"),
+        ));
         // Search mode border takes search_border (light_red under high-contrast)
         assert!(buffer.content.iter().any(|cell| cell.fg == Color::LightRed));
     }
@@ -10324,7 +10513,7 @@ mod tests {
             .set_text("#nosuchword");
         app.search_result = Some(("nosuchword".to_string(), Vec::new(), 0));
         let buffer = render_snapshot(&mut app, 120, 36);
-        assert!(buffer_contains(&buffer, "搜索模式: 未找到"));
+        assert!(buffer_contains(&buffer, &app.t("search_not_found")));
         // When there is no match there should be no search highlight
         assert!(cells_with_background(&buffer, Color::LightYellow).is_empty());
 
@@ -10337,7 +10526,7 @@ mod tests {
         plain_app.search_result = Some(("hello".to_string(), vec!["message-1".to_string()], 0));
         let plain_buffer = render_snapshot(&mut plain_app, 120, 36);
         assert!(cells_with_background(&plain_buffer, Color::LightYellow).is_empty());
-        assert!(buffer_contains(&plain_buffer, "消息输入"));
+        assert!(buffer_contains(&plain_buffer, &app.t("message_input")));
     }
 
     #[test]
@@ -10346,7 +10535,10 @@ mod tests {
         app.typing_members
             .push(("room-one".to_string(), "bob".to_string(), Instant::now()));
         let buffer = render_snapshot(&mut app, 120, 36);
-        assert!(buffer_contains(&buffer, "bob 正在输入"));
+        assert!(buffer_contains(
+            &buffer,
+            &app.t("typing_one").replace("{username}", "bob")
+        ));
         // Typing status of members in other rooms should not display on the current room title
         let mut other_room_app = chat_page_app_for_render("high-contrast");
         other_room_app.typing_members.push((
@@ -10355,7 +10547,10 @@ mod tests {
             Instant::now(),
         ));
         let other_room_buffer = render_snapshot(&mut other_room_app, 120, 36);
-        assert!(!buffer_contains(&other_room_buffer, "正在输入"));
+        assert!(!buffer_contains(
+            &other_room_buffer,
+            &app.t("typing_one").replace("{username}", "bob")
+        ));
     }
 
     #[test]
@@ -10393,11 +10588,11 @@ mod tests {
         // The same content rendered with two different appearances; the border color must switch with the theme
         let mut built_in_app = chat_page_app_for_render("default");
         let built_in_buffer = render_snapshot(&mut built_in_app, 120, 36);
-        assert_eq!(built_in_buffer[(0u16, 1u16)].fg, Color::Cyan);
+        assert_eq!(built_in_buffer[(0u16, 1u16)].fg, Color::Rgb(91, 107, 125));
 
         let mut light_app = chat_page_app_for_render("light");
         let light_buffer = render_snapshot(&mut light_app, 120, 36);
-        assert_eq!(light_buffer[(0u16, 1u16)].fg, Color::Rgb(138, 127, 109));
-        assert_eq!(light_buffer[(59u16, 20u16)].bg, Color::Rgb(239, 235, 226));
+        assert_eq!(light_buffer[(0u16, 1u16)].fg, Color::Rgb(168, 162, 147));
+        assert_eq!(light_buffer[(59u16, 20u16)].bg, Color::Rgb(244, 241, 234));
     }
 }

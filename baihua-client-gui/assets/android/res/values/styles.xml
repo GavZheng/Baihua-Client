@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Application theme referenced from Cargo.toml as
+  [package.metadata.android.application] theme = "@style/Baihua".
+  Why each item is here:
+  * parent NoActionBar: cargo-apk's default activity theme draws over the
+    status bar area; starting below the status bar makes the app's own top
+    bar tappable and keeps content out of the notch and the rounded corners.
+  * NOTE: keyboard-resize is NOT done here. `android:windowSoftInputMode` is
+    an <activity> attribute, not a theme attribute (the old entry was silently
+    inert); cargo-apk's manifest metadata cannot write it either, so
+    `src/android_platform.rs` sets SOFT_INPUT_ADJUST_RESIZE on the live window
+    at startup and keeps re-measuring the status-bar overlap on every viewport
+    change.
+-->
+<resources>
+    <style name="Baihua" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

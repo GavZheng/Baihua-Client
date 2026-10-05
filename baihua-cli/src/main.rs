@@ -9,6 +9,9 @@
 //!   (this program uses it to aggregate the versions of all installed ends);
 //!   all other command-line responsibilities are absent.
 //!
+//! `baihua gui` looks for `Baihua.app` where applications live: /Applications first, then
+//! `~/Applications`, then the installation prefix; none found means "not installed".
+//!
 //! Running without any arguments (also applies when double-clicking the executable after download):
 //! - If not all three ends are installed → directly enter the installation flow, installing
 //!   the command line, graphical, and terminal ends at once;
@@ -16,14 +19,13 @@
 //!   interface with `baihua gui` / `baihua tui`.
 
 use baihua_core::installer::{
-    self, InstallReport, InstallRequest, current_prefix, default_prefix, extract_archive, install,
-    install_from_command_line, uninstall_from_command_line,
+    self, InstallReport, current_prefix, default_prefix, install_from_command_line,
+    uninstall_from_command_line,
 };
-use baihua_core::paths;
 use baihua_core::update::{
     ReleaseChannel, ReleasePackage, UpdateCheck, check_for_update, download_package,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The three ends of the client: command line (this program), graphical, terminal.
@@ -77,7 +79,7 @@ fn run_command_line(arguments: &[String]) -> i32 {
         return run_without_arguments();
     };
     match first_argument.as_str() {
-        "client" | "tui" => launch_interface(ClientEnd::Terminal),
+        "tui" => launch_interface(ClientEnd::Terminal),
         "gui" => launch_interface(ClientEnd::Graphical),
         "help" | "--help" | "-h" => {
             print_help();
@@ -119,40 +121,64 @@ fn every_end_is_installed() -> bool {
         && installed_executable_path(ClientEnd::Terminal).is_some()
 }
 
-/// The path of this end in the default installation prefix; returns None if not installed.
+/// Where this end lives: the graphical end through the shared application search
+/// (Applications directories first, then the prefix payloads); the other two in `bin/`.
 fn installed_executable_path(end: ClientEnd) -> Option<PathBuf> {
+    if end == ClientEnd::Graphical {
+        return installer::graphical_application_path();
+    }
     let prefix = default_prefix()?;
-    let candidate = prefix.join("bin").join(end.executable_name());
-    candidate.is_file().then_some(candidate)
+    installer::installed_payload(&prefix, &end.executable_name())
 }
 
-/// Launch the interface of this end: prefer the one in the default installation prefix, then check the directory of this program (in the source tree all three ends are in the same directory),
-/// finally check PATH. The exit code of the interface process is passed through unchanged.
+/// Launch the interface of this end through locate_payload. The interface's exit code
+/// is passed through, and a payload found nowhere is reported as not installed.
 fn launch_interface(end: ClientEnd) -> i32 {
     let executable_name = end.executable_name();
-    let Some(executable_path) = locate_executable(end) else {
+    let Some(payload) = locate_payload(end) else {
         eprintln!(
             "the {} client ({executable_name}) is not installed; run `baihua install` first",
             end.display_name()
         );
         return 1;
     };
-    match Command::new(&executable_path).status() {
+    // An application bundle is a directory, not a file: hand it to the operating system
+    if payload.is_dir() {
+        return open_application_bundle(&payload);
+    }
+    match Command::new(&payload).status() {
         Ok(status) => status.code().unwrap_or(0),
         Err(error) => {
-            eprintln!("failed to start {}: {error}", executable_path.display());
+            eprintln!("failed to start {}: {error}", payload.display());
             1
         }
     }
 }
 
-/// Find the executable of this end: the `bin/` of the default installation prefix, this program's directory and its parent's `bin/`, PATH.
-fn locate_executable(end: ClientEnd) -> Option<PathBuf> {
+/// Start a macOS application bundle through `open`, which gives it the bundle identity
+/// (icon, dock entry, single instance) that exec'ing the inner binary would not have.
+fn open_application_bundle(bundle: &Path) -> i32 {
+    match Command::new("open").arg(bundle).status() {
+        Ok(status) if status.success() => 0,
+        Ok(status) => {
+            eprintln!("open {} failed with {status}", bundle.display());
+            1
+        }
+        Err(error) => {
+            eprintln!("failed to start {}: {error}", bundle.display());
+            1
+        }
+    }
+}
+
+/// Find this end's payload. The graphical end only accepts the recognised install
+/// locations (Applications directories, then the prefix payloads, see core installer).
+fn locate_payload(end: ClientEnd) -> Option<PathBuf> {
+    if end == ClientEnd::Graphical {
+        return installer::graphical_application_path();
+    }
     let file_name = end.executable_name();
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(prefix) = default_prefix() {
-        candidates.push(prefix.join("bin").join(&file_name));
-    }
     if let Ok(current_executable) = std::env::current_exe()
         && let Some(directory) = current_executable.parent()
     {
@@ -164,10 +190,20 @@ fn locate_executable(end: ClientEnd) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         candidates.extend(std::env::split_paths(&path).map(|directory| directory.join(&file_name)));
     }
-    candidates.into_iter().find(|candidate| candidate.is_file())
+    candidates.into_iter().find(|candidate| candidate.exists())
 }
 
-/// Version report: this program's own version, core library version, installation location, and the versions reported by the two interface ends.
+/// The runnable program inside a payload: a macOS bundle holds it under
+/// `Contents/MacOS`, every other payload already is the program itself.
+fn executable_program_path(payload: &Path) -> PathBuf {
+    if payload.is_dir() {
+        return payload
+            .join("Contents")
+            .join("MacOS")
+            .join(installer::graphical_executable_name());
+    }
+    payload.to_path_buf()
+}
 /// The interface end's version is obtained by running the installed executable and reading its `version` subcommand output,
 /// without maintaining a separate version manifest file, so after replacing the binary the report reflects the currently installed version.
 fn print_version_report() {
@@ -197,7 +233,7 @@ fn print_version_report() {
 /// Run the installed end and take the last whitespace-separated field from the first line of its `version` output.
 /// Both ends' first line is `<executable_name> <version>` (see their respective main.rs), so the last field is the version number.
 fn installed_end_version(end: ClientEnd) -> Option<String> {
-    let executable_path = installed_executable_path(end)?;
+    let executable_path = executable_program_path(&installed_executable_path(end)?);
     let output = Command::new(&executable_path)
         .arg("version")
         .output()
@@ -224,9 +260,11 @@ fn print_help() {
     println!("installed yet; when it is installed it prints the version report and the way to");
     println!("start each interface. Subcommands:");
     let command_lines: Vec<(&str, &str)> = vec![
-        ("gui", "Start the graphical interface (baihua-gui)"),
+        (
+            "gui",
+            "Start the installed Baihua.app (searched in the Applications folders)",
+        ),
         ("tui", "Start the terminal interface (baihua-tui)"),
-        ("client", "Same as tui"),
         ("help", "Print this help"),
         (
             "version",
@@ -234,7 +272,7 @@ fn print_help() {
         ),
         (
             "update",
-            "Check the three release channels separately and install what is newer; --check only reports",
+            "Update gui, tui or cli (bare form updates all three); --check only reports",
         ),
         (
             "install",
@@ -295,22 +333,44 @@ fn run_uninstall_command() -> i32 {
     }
 }
 
-/// `update`: each end checks its own channel; whoever has a newer version gets installed; `--check` only reports without installing.
-/// The order is command line, graphical, terminal: if the command line package happens to include another end, the subsequent checks for the other two ends
-/// will immediately upgrade them to their latest versions, rather than staying at the old version bundled in the package.
+/// `update`: check one end's channel, or all three when no end is named. `baihua update gui`
+/// upgrades only the graphical end; a bare `baihua update` walks all three ends in order.
 fn run_update_command(arguments: &[String]) -> i32 {
     let only_check = arguments.iter().any(|argument| argument == "--check");
+    let mut ends: Vec<ClientEnd> = Vec::new();
+    for argument in arguments {
+        if argument == "--check" {
+            continue;
+        }
+        let Some(end) = named_end(argument) else {
+            eprintln!("unknown update target {argument}; use gui, tui or cli");
+            return 2;
+        };
+        ends.push(end);
+    }
+    if ends.is_empty() {
+        ends = vec![
+            ClientEnd::CommandLine,
+            ClientEnd::Graphical,
+            ClientEnd::Terminal,
+        ];
+    }
     let mut exit_code = 0;
-    for end in [
-        ClientEnd::CommandLine,
-        ClientEnd::Graphical,
-        ClientEnd::Terminal,
-    ] {
+    for end in ends {
         exit_code = exit_code.max(update_one_end(end, only_check));
     }
     exit_code
 }
 
+/// The end a `baihua update <argument>` names: `cli`, `gui` or `tui`.
+fn named_end(argument: &str) -> Option<ClientEnd> {
+    match argument {
+        "cli" | "command" | "command-line" => Some(ClientEnd::CommandLine),
+        "gui" => Some(ClientEnd::Graphical),
+        "tui" | "terminal" => Some(ClientEnd::Terminal),
+        _ => None,
+    }
+}
 /// Update one end: the current version comes from this program itself (for the command line end) or from the installed executable; ends that have never been installed only prompt to install first.
 fn update_one_end(end: ClientEnd, only_check: bool) -> i32 {
     let current_version = match current_version_of(end) {
@@ -395,23 +455,18 @@ fn installation_prefix() -> Option<PathBuf> {
     current_prefix().or_else(default_prefix)
 }
 
-/// Download and immediately install a new version of this end: extract to the update directory and then install into the prefix.
-/// The command line end has no interface to exit, so after installation it can proceed to the next end, and thus does not take the "spawn and wait for process" path.
+/// Download and immediately install a new version of this end: the package format decides the
+/// path (archive, disk image, installer or AppImage), so `update` handles every end the same way.
+/// The command line end has no interface to exit, so it installs synchronously instead of
+/// spawning a detached installer that waits for itself.
 fn download_and_install(end: ClientEnd, package: &ReleasePackage) -> Result<InstallReport, String> {
-    let archive_path = download_package(package)?;
-    let staging_root = paths::update_directory()
-        .ok_or_else(|| "cannot locate the update directory".to_string())?;
-    let staged_directory = staging_root.join(format!(
-        "staged-{}-{}",
-        end.executable_name(),
-        package.version
-    ));
-    extract_archive(&archive_path, &staged_directory)?;
+    let package_path = download_package(package)?;
     let prefix = installation_prefix()
         .ok_or_else(|| "cannot determine the installation prefix".to_string())?;
-    install(&InstallRequest {
-        source_directory: staged_directory,
-        prefix,
+    installer::install_downloaded_package(&installer::PendingInstall {
+        package_path: package_path.to_string_lossy().to_string(),
+        version: format!("{}-{}", package.version, end.executable_name()),
+        prefix: prefix.to_string_lossy().to_string(),
         wait_for_process: None,
     })
 }

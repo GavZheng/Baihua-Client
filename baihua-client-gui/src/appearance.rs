@@ -1,6 +1,5 @@
-//! Theme conversion and avatar texturing. Both are a thin layer of glue that "turns session-layer data into interface resources".
-//! Also responsible for installing CJK fonts: egui's built-in fonts only have Latin glyphs, so a set of CJK fonts must be added,
-//! otherwise all Chinese text on the interface would be tofu blocks.
+//! Theme conversion, avatar texturing and the Chinese font install: egui ships
+//! Latin glyphs only, so a fallback font is added or Chinese shows as boxes.
 
 use baihua_core::config::{Palette, ThemeColor};
 use egui::epaint::text::{FontData, FontInsert, FontPriority, FontTweak, InsertFontFamily};
@@ -11,33 +10,32 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// The name of the CJK fallback font installed into egui (used as a key in the font table)
-fn cjk_font_name() -> &'static str {
+fn chinese_font_name() -> &'static str {
     "baihua-cjk"
 }
 
-/// Warm up one empty frame. `Context`'s font table only builds up after running a frame (querying the font table before the first frame will panic),
-/// and fonts added via `Context::add_font` only take effect at the start of the next frame, so "run a frame before and after installing fonts"
-/// is the fixed prerequisite here.
+/// Warm up one empty frame: the font table only exists after a frame, and an
+/// `add_font` call takes effect at the start of the next one.
 fn run_one_empty_frame(context: &Context) {
     context
         .run_ui(egui::RawInput::default(), |_ui| {})
         .drop_without_applying_deltas();
 }
 
-/// Temporary font table key name used when probing the baseline. Only measured once before "installing fonts for the real interface use",
-/// then discard together with the temporary context.
+/// Font table key used only while probing the baseline; it is discarded with
+/// the temporary context.
 fn probe_font_name() -> &'static str {
     "baihua-cjk-probe"
 }
 
-/// Font size used when probing the baseline (in points). What matters is the "ratio of offset to font size"; the actual font size doesn't affect the result.
+/// Font size used while probing the baseline; only the offset-to-size ratio
+/// matters, so the value itself is free.
 fn probe_font_size() -> f32 {
     14.0
 }
 
-/// Place one character, get back its baseline Y coordinate (relative to the top of that line).
-/// egui treats each glyph's `pos.y` as the baseline (glyph bitmaps are placed relative to this line via `uv_rect.offset`);
-/// returns None when the character can't be placed in the current font family.
+/// Baseline Y of one character relative to the top of its line (egui puts the
+/// baseline in `glyph.pos.y`); None when the family cannot shape it.
 fn glyph_baseline(context: &Context, family: FontFamily, character: char) -> Option<f32> {
     let font_id = FontId::new(probe_font_size(), family);
     context.fonts_mut(|fonts| {
@@ -51,21 +49,9 @@ fn glyph_baseline(context: &Context, family: FontFamily, character: char) -> Opt
     })
 }
 
-/// How much higher CJK glyphs are than Latin letters in the same font family, converted to a "vertical offset ratio scaled by font size".
-///
-/// When egui places fallback font glyphs, the baseline is taken as `ascent + (main font line height - ascent line height) / 2`:
-/// CJK font line height is significantly larger than egui's built-in Latin font (on the dev machine, Dongqing Heiti is 1.5x font size,
-/// while Ubuntu-Light is only 1.15x) — this "centering difference" pushes the entire CJK text upward —
-/// at 14pt the CJK baseline is actually raised by 3 points, glyphs even protrude beyond the line box,
-/// mixed Chinese-English text makes CJK characters noticeably higher. This is the root cause of "CJK characters display shifted upward".
-///
-/// The fix is to first install the same font in a temporary context, measure the baseline difference between Latin letters and CJK characters in the same family,
-/// then pass it to `FontTweak::y_offset_factor`: egui will place CJK glyphs on the same baseline.
-/// The proportional and monospace families share this ratio: the Latin fonts of both families (Ubuntu-Light and Hack) have very similar vertical proportions
-/// (differing by less than 0.02x font size), and the test asserts baseline alignment for both families.
-/// The probe must happen before "installing fonts for the real interface use", so the temporary context must occupy its own font bytes,
-/// measure and immediately release; the one used by the interface is unaffected.
-fn cjk_baseline_offset_factor(bytes: &[u8], face_index: u32) -> f32 {
+/// Chinese-versus-Latin baseline difference as a `FontTweak::y_offset_factor`:
+/// egui centers fallback glyphs on the taller Chinese line box, so they ride high.
+fn baseline_offset(bytes: &[u8], face_index: u32) -> f32 {
     let probe = Context::default();
     run_one_empty_frame(&probe);
     probe.add_font(FontInsert::new(
@@ -82,31 +68,23 @@ fn cjk_baseline_offset_factor(bytes: &[u8], face_index: u32) -> f32 {
     ));
     run_one_empty_frame(&probe);
     let latin = glyph_baseline(&probe, FontFamily::Proportional, 'A');
+    // The Han literal is the measurement probe (a real ideograph is needed to
+    // read its baseline), not display text.
     let chinese = glyph_baseline(&probe, FontFamily::Proportional, '你');
     match (latin, chinese) {
         (Some(latin), Some(chinese)) => (latin - chinese) / probe_font_size(),
-        // This font cannot render the probe characters: better to have no offset than to add an offset out of thin air
+        // The font cannot shape the probe characters: no offset beats a made-up one.
         _ => 0.0,
     }
 }
 
-/// Add CJK fonts to egui's font table.
-///
-/// The approach is to append a set of "lowest priority" fallback fonts via `Context::add_font`: egui's built-in default font
-/// is still checked first, Latin letters, numbers, and symbols keep their default appearance; only when a glyph (CJK,
-/// full-width punctuation) cannot be found in the previous sets, it falls back to this CJK font.
-/// This is more stable than replacing everything with `set_fonts`: it neither requires rebuilding the default font table nor breaks egui's built-in appearance.
-///
-/// The fallback font is "foreign"; egui determines its baseline by its own rules, which would push CJK characters above Latin letters,
-/// so before installing we measure the difference and use `FontTweak::y_offset_factor` to bring CJK back to the same baseline.
-///
-/// If no candidate is found in the system, return directly; the interface starts normally (Chinese would display as placeholder boxes,
-/// but it won't fail to start due to missing fonts). Fonts are installed only once, called in `BaihuaApp::new()`.
-pub fn install_cjk_font(context: &Context) {
-    let Some((bytes, face_index)) = baihua_core::fonts::discover_cjk_font() else {
+/// Append the Chinese fallback font at lowest priority with the measured baseline
+/// correction, once at startup; no font found only means boxes, never a failure.
+pub fn install_chinese_font(context: &Context) {
+    let Some((bytes, face_index)) = fallback_font() else {
         return;
     };
-    let offset_factor = cjk_baseline_offset_factor(&bytes, face_index);
+    let offset_factor = baseline_offset(&bytes, face_index);
     let font_data = FontData {
         font: Cow::Owned(bytes),
         index: face_index,
@@ -115,10 +93,10 @@ pub fn install_cjk_font(context: &Context) {
             ..Default::default()
         },
     };
-    // Both CJK font slots must be registered: Proportional for body text, Monospace for monospace areas,
-    // without the monospace one, CJK characters in the monospace family would still be boxes
+    // Both families must be registered: without the monospace slot the Chinese
+    // characters in monospace areas would still be boxes.
     context.add_font(FontInsert::new(
-        cjk_font_name(),
+        chinese_font_name(),
         font_data,
         vec![
             InsertFontFamily {
@@ -133,12 +111,29 @@ pub fn install_cjk_font(context: &Context) {
     ));
 }
 
-/// After installing fonts, do a self-check: whether the current egui font table has that CJK font.
-/// Only used in tests (not checked during normal operation), used to assert "the font installation actually worked".
+/// The Chinese font bytes and the face index to install. The system font wins
+/// where readable; the iOS sandbox cannot read it, so the embedded subset takes over.
+fn fallback_font() -> Option<(Vec<u8>, u32)> {
+    if let Some((bytes, face_index)) = baihua_core::fonts::discover_cjk_font() {
+        return Some((bytes, face_index));
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let bytes = crate::embedded_font_bytes();
+        if !bytes.is_empty() {
+            // The embedded file is a single-face `.ttf`, so face index 0.
+            return Some((bytes.to_vec(), 0));
+        }
+    }
+    None
+}
+
+/// Test-only self-check: whether the font table carries the fallback font, so
+/// the tests can assert the install actually worked.
 #[cfg(test)]
-pub fn cjk_font_is_installed(context: &Context) -> bool {
+pub fn font_is_installed(context: &Context) -> bool {
     let definitions: egui::FontDefinitions = context.fonts(|fonts| fonts.definitions().clone());
-    definitions.font_data.contains_key(cjk_font_name())
+    definitions.font_data.contains_key(chinese_font_name())
 }
 
 fn to_color32(color: ThemeColor) -> Color32 {
@@ -151,20 +146,17 @@ fn to_color32(color: ThemeColor) -> Color32 {
     }
 }
 
-/// Is this color light when used as a background: light backgrounds need dark text, dark backgrounds need light text,
-/// and also determines whether the baseline visuals applied to egui use light or dark colors.
-/// The weighted formula matches `ThemeColor::brightness` in `baihua-session`,
-/// so both sides won't disagree on "light or dark".
-fn is_light_background(color: Color32) -> bool {
+/// Whether a color is light when used as a background; it also picks the light
+/// or dark egui baseline. The weights match `ThemeColor::brightness`.
+pub(crate) fn is_light_background(color: Color32) -> bool {
     let brightness =
         (color.r() as u32 * 299 + color.g() as u32 * 587 + color.b() as u32 * 114) / 1000;
     brightness >= 128
 }
 
-/// Pick a readable foreground color for a color "used as a background". Theme slot background colors, search match backgrounds,
-/// only guarantee the background looks good; using them directly as text colors would result in light-on-light or dark-on-dark,
-/// so text colors are always derived from the background brightness here.
-pub(crate) fn contrasting_foreground(background: Color32) -> Color32 {
+/// Readable foreground for a color used as a background: theme backgrounds only
+/// guarantee the background, so the text color is derived from its brightness.
+pub(crate) fn contrasting_text(background: Color32) -> Color32 {
     if is_light_background(background) {
         Color32::BLACK
     } else {
@@ -172,7 +164,8 @@ pub(crate) fn contrasting_foreground(background: Color32) -> Color32 {
     }
 }
 
-/// Color set for interface rendering. Fields correspond one-to-one with theme slots; missing items are fallbacks from `Palette::built_in`.
+/// Color set for interface rendering; the fields map onto the theme slots (the
+/// selection takes the own-bubble color), `Palette::built_in` fills the rest.
 #[derive(Clone)]
 pub struct Skin {
     pub app_background: Color32,
@@ -191,9 +184,13 @@ pub struct Skin {
     pub input_text: Color32,
     pub command_border: Color32,
     pub search_border: Color32,
+    /// Selection highlight (selected buttons, rows and marked text): deliberately
+    /// the own-message bubble color, so "chosen" reads as one color everywhere.
     pub selection_background: Color32,
     pub search_match_background: Color32,
     pub search_current_match_background: Color32,
+    /// Tint applied to the button images: the shipped images are pure white
+    pub icon_color: Color32,
 }
 
 impl Skin {
@@ -215,17 +212,17 @@ impl Skin {
             input_text: to_color32(palette.input_text),
             command_border: to_color32(palette.command_border),
             search_border: to_color32(palette.search_border),
-            selection_background: to_color32(palette.selection_background),
+            // The unification: a clicked-selected button wears the own-bubble color
+            // (the conversation fills own bubbles with `own_username_text`).
+            selection_background: to_color32(palette.own_username_text),
             search_match_background: to_color32(palette.search_match_background),
             search_current_match_background: to_color32(palette.search_current_match_background),
+            icon_color: to_color32(palette.icon_color),
         }
     }
 
-    /// Apply the theme to egui's visuals: panel backgrounds, widget backgrounds, and text colors all come from the user-selected theme.
-    ///
-    /// Baseline visuals are chosen by theme background brightness: dark backgrounds use egui's dark baseline, light backgrounds use light baseline.
-    /// When only the dark baseline is used, "derived" colors like button backgrounds in light themes remain dark,
-    /// so dark text on dark backgrounds becomes unreadable on light backgrounds.
+    /// Map the theme onto egui visuals: the baseline (dark or light) follows the
+    /// theme background brightness so derived colors (button fills) stay readable.
     pub fn apply_to(&self, context: &Context) {
         let mut visuals = if is_light_background(self.app_background) {
             Visuals::light()
@@ -238,15 +235,11 @@ impl Skin {
         visuals.faint_bg_color = self.app_background;
         visuals.override_text_color = Some(self.message_text);
         visuals.selection.bg_fill = self.selection_background;
-        // The foreground color of selected text must contrast with the selection background: previously this used the app background color directly,
-        // and the input field background color source is the app background color, so "the selected text in the input field matches the input field background exactly",
-        // the selected text is directly invisible (the input field border on focus also uses this color, so it disappears too)
-        visuals.selection.stroke.color = contrasting_foreground(self.selection_background);
-        // Widget (button, input field) backgrounds and borders also come from the theme, and retain three states: "normal/hover/pressed":
-        // previously button backgrounds were the egui default theme's (dark text on dark background in light themes),
-        // while hardcoding a `fill` for a specific button would also eliminate the hover and click feedback.
-        // the normal state `bg_stroke` is "buttons must have a border by default": width 1.0,
-        // hover and press only change the border color, not "whether there is a border", so there is a frame even when the mouse is not over it.
+        // Selected text must contrast with the selection background: the app
+        // background used here made it identical to the input box fill.
+        visuals.selection.stroke.color = contrasting_text(self.selection_background);
+        // Widget fills and borders come from the theme so hover and press states
+        // survive; every button carries a 1-point border to read as clickable.
         for (widget, fill, stroke_color) in [
             (
                 &mut visuals.widgets.inactive,
@@ -265,28 +258,21 @@ impl Skin {
             ),
         ] {
             widget.weak_bg_fill = fill;
-            // `bg_fill` is the background color source for checkboxes (the "switches" in the settings panel): egui's default is its own gray,
-            // when the theme only writes `weak_bg_fill` the checkbox still has egui's gray background, and the border and background collide so "no border is visible".
-            // background colors all follow the theme; the only visible boundary left for the checkbox in its normal state is this border given by the theme.
+            // `bg_fill` is the checkbox (settings switch) fill: leaving it at
+            // the egui gray would swallow the themed border of a resting switch.
             widget.bg_fill = fill;
             widget.bg_stroke = Stroke::new(1.0, stroke_color);
         }
-        // theme colors must be written into egui's **both dark and light style variants** simultaneously, not just "the current one".
-        //
-        // the default theme preference is "follow system", but the program doesn't know if the system is light or dark on startup
-        // (`Context::theme()` gets the fallback dark one first), the variant written by `set_visuals`
-        // might not be the one that actually takes effect later: the other variant is still egui default appearance,
-        // so buttons only have borders on hover, and the input field background collides with the text color in the theme (white on white),
-        // and isn't corrected until the user switches language or appearance for the first time (at which point it gets rewritten once).
-        // write both variants as this theme's settings, so no matter which variant egui picks, the interface appearance is determined by the theme.
+        // Write the theme into BOTH style variants: the effective one at startup
+        // may not be first probed, and an unwritten one shows egui defaults.
         for theme in [Theme::Dark, Theme::Light] {
             context.set_visuals_of(theme, visuals.clone());
         }
     }
 }
 
-/// Button hover fill: a slight brightness change on the app background (darken light backgrounds, brighten dark backgrounds),
-/// matching the meaning of egui's built-in widgets "brighter/darker on hover".
+/// Button hover fill: the app background slightly darkened or brightened, which
+/// is what the egui built-in widgets mean by a hover state.
 fn widget_hover_fill(background: Color32) -> Color32 {
     if is_light_background(background) {
         background.gamma_multiply(0.94)
@@ -304,9 +290,8 @@ fn widget_active_fill(background: Color32) -> Color32 {
     }
 }
 
-/// What an avatar image needs to do to go from "has bytes" to "can be drawn": decode + scale proportionally.
-/// This is pure CPU work (scaling a large image to 32×32 with Lanczos takes milliseconds to tens of milliseconds),
-/// leaving it in the render thread would make the interface stutter, so it's uniformly handed to the decoder thread pool below.
+/// One avatar job: decode the bytes and scale them. This is pure CPU work that
+/// would stutter the render thread, so it goes to the decoder pool below.
 struct AvatarDecodeJob {
     /// Cache key: (user ID, side length in pixels)
     key: (String, usize),
@@ -328,8 +313,8 @@ struct AvatarDecodeResult {
     image: Option<egui::ColorImage>,
 }
 
-/// Avatar decoder thread pool: fixed number of threads take tasks from the same queue, decode and send results back to the render thread.
-/// Thread count is machine parallelism (max 4); blocks when queue is empty, exits when channel closes (client exits).
+/// Decoder pool: a fixed number of threads take jobs from one queue and send the
+/// results back. They block on an empty queue and exit when the channel closes.
 struct AvatarDecoder {
     /// Job sender: render thread only submits, doesn't wait for results
     jobs: std::sync::mpsc::Sender<AvatarDecodeJob>,
@@ -342,7 +327,7 @@ impl AvatarDecoder {
         let (job_sender, job_receiver) = std::sync::mpsc::channel::<AvatarDecodeJob>();
         let (result_sender, result_receiver) = std::sync::mpsc::channel::<AvatarDecodeResult>();
         let shared_jobs = std::sync::Arc::new(std::sync::Mutex::new(job_receiver));
-        for _ in 0..avatar_decode_worker_count() {
+        for _ in 0..decode_worker_count() {
             let jobs = std::sync::Arc::clone(&shared_jobs);
             let results = result_sender.clone();
             std::thread::spawn(move || {
@@ -375,7 +360,7 @@ impl AvatarDecoder {
 }
 
 /// Number of decode threads: machine parallelism, max 4, min 1
-fn avatar_decode_worker_count() -> usize {
+fn decode_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get().min(4))
         .unwrap_or(1)
@@ -393,8 +378,8 @@ enum AvatarTextureState {
     Unavailable(u64),
 }
 
-/// Avatar texture cache: key is (user ID, side length in pixels). Changed bytes (avatar swap) use "byte fingerprint" to decide whether to reload.
-/// Decoding happens in background thread; render thread each frame only does two light tasks: receiving results, looking up cache (uploading decoded image when needed).
+/// Texture cache for program images (avatars, embedded logo) keyed by (name, side
+/// in pixels); decoding runs in the background, changed bytes reload by fingerprint.
 #[derive(Default)]
 pub struct AvatarTextures {
     /// Which step of the lifecycle each avatar is currently in
@@ -404,8 +389,8 @@ pub struct AvatarTextures {
 }
 
 impl AvatarTextures {
-    /// Get the texture for a user at side pixels; returns None if no avatar, still decoding, or decode failed (interface draws placeholder letter).
-    /// When seeing bytes for the first time, only queue for decoding and return immediately; never decode the image in this frame.
+    /// Texture for a user at `side` pixels, or None while there is no avatar, it is
+    /// decoding or it failed. The first sight of new bytes only queues the job.
     pub fn texture(
         &mut self,
         context: &Context,
@@ -413,7 +398,7 @@ impl AvatarTextures {
         bytes: Option<&[u8]>,
         side: usize,
     ) -> Option<TextureHandle> {
-        self.collect_decoded_images();
+        self.collect_decoded();
         let bytes = bytes?;
         let fingerprint = fingerprint(bytes);
         let key = (user_id.to_string(), side);
@@ -450,14 +435,66 @@ impl AvatarTextures {
         None
     }
 
-    /// No need to clear cache when theme or directory changes: avatars use byte fingerprint; size changes create a new cache entry
+    /// Decode a fixed program image (the embedded logo) synchronously and cache the
+    /// texture by fingerprint: the bytes are small, so no decoder pool is needed.
+    pub(crate) fn embedded_texture(
+        &mut self,
+        context: &Context,
+        name: &str,
+        bytes: &[u8],
+        side: usize,
+    ) -> Option<TextureHandle> {
+        self.program_texture(context, name, bytes, side, load_rgba_image)
+    }
+
+    /// Texture for one button image: decoded without cropping so the icon keeps its
+    /// own aspect ratio, then cached exactly like every other program image.
+    pub(crate) fn icon_texture(
+        &mut self,
+        context: &Context,
+        name: &str,
+        bytes: &[u8],
+        maximum_side: usize,
+    ) -> Option<TextureHandle> {
+        self.program_texture(context, name, bytes, maximum_side, load_rgba_fitted)
+    }
+
+    /// The shared cache path for program images: hit by (name, side) plus byte
+    /// fingerprint, otherwise decode with `decode` and upload a fresh texture.
+    fn program_texture(
+        &mut self,
+        context: &Context,
+        name: &str,
+        bytes: &[u8],
+        side: usize,
+        decode: fn(&[u8], usize) -> Option<egui::ColorImage>,
+    ) -> Option<TextureHandle> {
+        self.collect_decoded();
+        let key = (name.to_string(), side);
+        let fingerprint = fingerprint(bytes);
+        if let Some(AvatarTextureState::Uploaded(cached, handle)) = self.entries.get(&key)
+            && *cached == fingerprint
+        {
+            return Some(handle.clone());
+        }
+        let image = decode(bytes, side)?;
+        let handle = context.load_texture(name.to_string(), image, TextureOptions::LINEAR);
+        self.entries.insert(
+            key,
+            AvatarTextureState::Uploaded(fingerprint, handle.clone()),
+        );
+        Some(handle)
+    }
+
+    /// Drop one user's entry; a theme change needs no clearing because the cache
+    /// is keyed by byte fingerprint and side.
     pub fn forget(&mut self, user_id: &str) {
         self.entries
             .retain(|(cached_user, _), _| cached_user != user_id);
     }
 
     /// collect results returned by the decode thread into the table (once per frame, non-blocking)
-    fn collect_decoded_images(&mut self) {
+    fn collect_decoded(&mut self) {
         let Some(decoder) = &self.decoder else {
             return;
         };
@@ -471,7 +508,8 @@ impl AvatarTextures {
     }
 }
 
-/// Lightweight byte fingerprint: length + first and last few bytes, enough to determine "has the avatar changed"
+/// Cheap byte fingerprint (length plus the first and last few bytes), enough to
+/// tell whether an avatar changed.
 fn fingerprint(bytes: &[u8]) -> u64 {
     let mut value = bytes.len() as u64;
     for byte in bytes.iter().take(8).chain(bytes.iter().rev().take(8)) {
@@ -480,7 +518,26 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     value
 }
 
-/// Decode and scale to side×side RGBA image (crop to square centered on short side first, then scale; avatar won't deform)
+/// Decode an image scaled so its longest side is `side`, aspect ratio kept: button
+/// icons are not square and must not be cropped into one.
+fn load_rgba_fitted(bytes: &[u8], side: usize) -> Option<egui::ColorImage> {
+    use image::GenericImageView;
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let resized = decoded.resize(
+        side as u32,
+        side as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let (width, height) = resized.dimensions();
+    let rgba = resized.to_rgba8().into_raw();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [width as usize, height as usize],
+        &rgba,
+    ))
+}
+
+/// Decode and scale to a `side` by `side` RGBA image, cropping to a centered
+/// square first so the avatar does not deform.
 fn load_rgba_image(bytes: &[u8], side: usize) -> Option<egui::ColorImage> {
     use image::GenericImageView;
     let decoded = image::load_from_memory(bytes).ok()?;
@@ -506,26 +563,19 @@ fn load_rgba_image(bytes: &[u8], side: usize) -> Option<egui::ColorImage> {
 
 #[cfg(test)]
 mod font_tests {
-    use super::{cjk_font_is_installed, install_cjk_font, probe_font_size, run_one_empty_frame};
+    use super::{font_is_installed, install_chinese_font, probe_font_size, run_one_empty_frame};
     use egui::epaint::text::{FontData, FontInsert, FontPriority, FontTweak, InsertFontFamily};
     use egui::{Color32, Context, FontFamily, FontId};
     use std::borrow::Cow;
 
     /// A character that "definitely has no glyph": Unicode non-character code point, no font should accept it.
     /// Use the glyph rendered by it as the baseline for "replacement box".
-    fn guaranteed_missing_character() -> char {
+    fn missing_character() -> char {
         '\u{10FFFD}'
     }
 
-    /// Quantifiable drawing features of a glyph: advance width, texture rectangle size and offset.
-    ///
-    /// Comparing only advance width isn't stable: the width of the replacement box drawn by egui sometimes happens to be close to the CJK character's body width
-    /// (measured: PingFang at 14pt renders "you" as 14.0, box as 14.396, difference only 0.4).
-    /// But the replacement box's texture size and offset are identical to missing-character glyphs, while real glyphs each have their own bitmaps,
-    /// so "whether the drawing features match the missing-character baseline" is the reliable criterion.
-    ///
-    /// Deliberately excludes the character itself: characters are obviously different; including it would make every character "different from the baseline",
-    /// which would invalidate the criterion.
+    /// A glyph's drawing signature (advance, rect size, offset) against the
+    /// missing-character baseline: the replacement box is identical for all of them.
     #[derive(Debug, PartialEq)]
     struct GlyphSignature {
         advance_width: f32,
@@ -557,25 +607,20 @@ mod font_tests {
     }
 
     /// whether a character in a certain font family is rendered as a real glyph (not a replacement box identical to the missing-character glyph)
-    fn character_is_rendered_with_a_real_glyph(
-        context: &Context,
-        family: FontFamily,
-        character: char,
-    ) -> bool {
+    fn has_real_glyph(context: &Context, family: FontFamily, character: char) -> bool {
         let Some(character_glyph) = glyph_signature(context, family.clone(), character) else {
             return false;
         };
-        let Some(missing_glyph) = glyph_signature(context, family, guaranteed_missing_character())
-        else {
+        let Some(missing_glyph) = glyph_signature(context, family, missing_character()) else {
             return false;
         };
         character_glyph != missing_glyph
     }
 
     /// A context that has installed CJK fonts and run a frame for the fonts to take effect
-    fn context_with_cjk_font_installed() -> Context {
+    fn aligned_context() -> Context {
         let context = warmed_up_context();
-        install_cjk_font(&context);
+        install_chinese_font(&context);
         run_one_empty_frame(&context);
         context
     }
@@ -587,89 +632,66 @@ mod font_tests {
         context
     }
 
-    /// Regression for this round's feedback "default font can't display Chinese": after installing fonts,
-    /// every Chinese character must be rendered as a real glyph (not a replacement box).
+    /// After the install every Chinese character must shape into a real glyph in
+    /// both families; skipped when this machine offers no fallback font at all.
     #[test]
-    fn chinese_text_gets_real_glyphs_after_installing_the_font() {
+    fn glyphs_after_install() {
         if baihua_core::fonts::discover_cjk_font().is_none() {
-            // this machine has no CJK font candidates: this is an allowed degradation, skip the assertion
             return;
         }
-        let context = context_with_cjk_font_installed();
+        let context = aligned_context();
         assert!(
-            cjk_font_is_installed(&context),
-            "装过字体之后字体表里应当有汉字字体"
+            font_is_installed(&context),
+            "the installed font table must contain the fallback font"
         );
-        for character in "你好百花客户端".chars() {
-            assert!(
-                character_is_rendered_with_a_real_glyph(
-                    &context,
-                    FontFamily::Proportional,
-                    character
-                ),
-                "装过字体后 {character:?} 应当排成真实字形，而不是替代方框"
-            );
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            for character in "你好百花客户端".chars() {
+                assert!(
+                    has_real_glyph(&context, family.clone(), character),
+                    "{character:?} in {family:?} must shape into a real glyph, not a box"
+                );
+            }
         }
     }
 
-    /// Without fonts installed, Chinese is just replacement boxes: this conversely proves the assertion above is actually testing fonts,
-    /// not that egui can draw Chinese by default (otherwise this regression test would be a sham)
+    /// Without the install Chinese is only replacement boxes: the converse that
+    /// proves the test above really measures the font and not an egui default.
     #[test]
-    fn chinese_text_is_just_a_replacement_box_without_installing_the_font() {
+    fn boxes_without_font() {
         let context = warmed_up_context();
         assert!(
-            !cjk_font_is_installed(&context),
-            "默认字体表里不该有我们那套汉字字体"
+            !font_is_installed(&context),
+            "the default font table must not carry the fallback font"
         );
         for character in "你好".chars() {
             assert!(
-                !character_is_rendered_with_a_real_glyph(
-                    &context,
-                    FontFamily::Proportional,
-                    character
-                ),
-                "{character:?} 在没装汉字字体时应当与替代方框同宽"
+                !has_real_glyph(&context, FontFamily::Proportional, character),
+                "{character:?} without the font must measure as the replacement box"
             );
         }
     }
 
-    /// Must also render real glyphs in the monospace family: Chinese rendered in monospace must not be boxes
+    /// Installing the fallback must not touch Latin letters and digits: the
+    /// built-in font is still consulted first, so their shapes stay identical.
     #[test]
-    fn chinese_text_gets_real_glyphs_in_the_monospace_family_too() {
-        if baihua_core::fonts::discover_cjk_font().is_none() {
-            return;
-        }
-        let context = context_with_cjk_font_installed();
-        for character in "你好".chars() {
-            assert!(
-                character_is_rendered_with_a_real_glyph(&context, FontFamily::Monospace, character),
-                "等宽族里的 {character:?} 也应当排成真实字形"
-            );
-        }
-    }
-
-    /// Installing CJK fonts must not affect Latin letters: egui's built-in font is still checked first,
-    /// English and numbers keep their original glyphs and widths
-    #[test]
-    fn latin_text_keeps_the_default_font_after_installing() {
+    fn latin_keeps_default() {
         if baihua_core::fonts::discover_cjk_font().is_none() {
             return;
         }
         let before = warmed_up_context();
-        let after = context_with_cjk_font_installed();
+        let after = aligned_context();
         for character in "Hello123".chars() {
             let before_glyph = glyph_signature(&before, FontFamily::Proportional, character);
             let after_glyph = glyph_signature(&after, FontFamily::Proportional, character);
             assert_eq!(
                 before_glyph, after_glyph,
-                "拉丁字母与数字的字形不该被汉字兜底字体改变，出问题的是 {character:?}"
+                "latin letters and digits must not change shape because of the fallback; the culprit is {character:?}"
             );
         }
     }
 
-    /// Where a glyph is placed: baseline Y coordinate and top of glyph bitmap Y coordinate (both relative to top of line).
-    /// The difference is "how far above the baseline the ink top is", which is determined only by the font itself,
-    /// so it can be measured in an unaligned arrangement and then used in the aligned one.
+    /// Glyph placement: baseline Y and bitmap-top Y, both from the line top. Their
+    /// difference depends only on the font, so the unaligned run can measure it.
     struct GlyphPlacement {
         baseline: f32,
         ink_top: f32,
@@ -698,7 +720,7 @@ mod font_tests {
 
     /// Install CJK font without baseline correction: as a "before fix" control to measure how much CJK was pushed up.
     /// Returns None if no CJK font on the system (skip assertions on this machine).
-    fn context_with_unaligned_cjk_font() -> Option<Context> {
+    fn unaligned_context() -> Option<Context> {
         let (bytes, face_index) = baihua_core::fonts::discover_cjk_font()?;
         let context = warmed_up_context();
         context.add_font(FontInsert::new(
@@ -723,75 +745,82 @@ mod font_tests {
         Some(context)
     }
 
-    /// Regression for feedback "CJK characters display shifted upward": when installing fonts must shift CJK glyphs down,
-    /// so its baseline lands on the same line as the Latin baseline of the same family.
-    ///
-    /// How far the CJK ink top is from the baseline is determined only by the font itself; first measure this distance in the "without correction" control,
-    /// then add it back to the ink top after the fix, which reverse-engineers where the CJK baseline should be after the fix.
+    /// Baseline regression: the Han baseline must sit level with the Latin one in
+    /// both families, and a glyph that poked out of the line box must stay inside.
     #[test]
-    fn chinese_glyphs_share_the_latin_baseline() {
-        let Some(unaligned) = context_with_unaligned_cjk_font() else {
+    fn baseline_alignment() {
+        let Some(unaligned) = unaligned_context() else {
             return;
         };
-        let aligned = context_with_cjk_font_installed();
+        let aligned = aligned_context();
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             let latin = glyph_placement(&aligned, family.clone(), 'A')
-                .expect("拉丁字母在任何字体表里都排得出来");
-            let unaligned_chinese = glyph_placement(&unaligned, family.clone(), '你')
-                .expect("装过汉字字体后应当排得出汉字");
-            let aligned_chinese = glyph_placement(&aligned, family.clone(), '你')
-                .expect("装过汉字字体后应当排得出汉字");
-            let ink_top_above_baseline = unaligned_chinese.ink_top - unaligned_chinese.baseline;
-            let chinese_baseline = aligned_chinese.ink_top - ink_top_above_baseline;
+                .expect("latin letters shape in any font table");
+            let before = glyph_placement(&unaligned, family.clone(), '你')
+                .expect("Han glyphs must shape once the font is installed");
+            let after = glyph_placement(&aligned, family.clone(), '你')
+                .expect("Han glyphs must shape once the font is installed");
+            let ink_top_above_baseline = before.ink_top - before.baseline;
+            let chinese_baseline = after.ink_top - ink_top_above_baseline;
             assert!(
                 (chinese_baseline - latin.baseline).abs() <= 0.5,
-                "{family:?} 里汉字的基线应当与拉丁字母齐平：拉丁 {}，汉字 {}",
+                "the Han baseline in {family:?} must sit level with the latin one: latin {}, Han {}",
                 latin.baseline,
                 chinese_baseline
+            );
+            if before.ink_top < 0.0 {
+                assert!(
+                    after.ink_top >= 0.0,
+                    "after the fix Han glyphs must not poke above the row box, bitmap top was {}",
+                    after.ink_top
+                );
+            }
+        }
+    }
+
+    /// The settings button uses the gear character, so it must shape into a real
+    /// glyph; skipped when this machine offers no fallback font.
+    #[test]
+    fn settings_glyph() {
+        if baihua_core::fonts::discover_cjk_font().is_none() {
+            return;
+        }
+        let context = aligned_context();
+        for character in crate::app::settings_button_text().chars() {
+            assert!(
+                has_real_glyph(&context, FontFamily::Proportional, character),
+                "{character:?} on the settings button must render as a real glyph, not a box"
             );
         }
     }
 
-    /// Intuitive consequence of "shifted upward": CJK glyphs are pushed beyond the line box.
-    /// First confirm the control (without correction) actually protrudes beyond the line box, otherwise it means this machine's font combination
-    /// doesn't have this phenomenon, so the assertion is meaningless — skip it.
+    /// iOS regression: the embedded subset is the only font source there, so it
+    /// must be a plausible subset size and shape the interface's own strings.
+    #[cfg(target_os = "ios")]
     #[test]
-    fn chinese_glyphs_stay_inside_the_line_box_after_the_fix() {
-        let Some(unaligned) = context_with_unaligned_cjk_font() else {
-            return;
-        };
-        let aligned = context_with_cjk_font_installed();
-        let before = glyph_placement(&unaligned, FontFamily::Proportional, '你')
-            .expect("装过汉字字体后应当排得出汉字");
-        if before.ink_top >= 0.0 {
-            return;
-        }
-        let after = glyph_placement(&aligned, FontFamily::Proportional, '你')
-            .expect("装过汉字字体后应当排得出汉字");
+    fn embedded_font() {
+        let bytes = crate::embedded_font_bytes();
         assert!(
-            after.ink_top >= 0.0,
-            "修好之后汉字不该冒出到行框上沿之外，实际位图上沿 {}",
-            after.ink_top
+            bytes.len() > 100_000,
+            "the embedded subset must carry real glyphs, it is {} bytes",
+            bytes.len()
         );
-    }
-
-    /// The settings entry uses the gear character (the button to the right of the room title).
-    /// It must be renderable as a real glyph in the font table, otherwise it would be a tofu block on the interface.
-    /// Skip if this machine has no CJK font (allowed degradation).
-    #[test]
-    fn settings_button_character_has_a_real_glyph() {
-        if baihua_core::fonts::discover_cjk_font().is_none() {
-            return;
-        }
-        let context = context_with_cjk_font_installed();
-        for character in crate::app::settings_button_text().chars() {
+        assert!(
+            bytes.len() < 12_000_000,
+            "the embedded subset must stay a subset, it is {} bytes",
+            bytes.len()
+        );
+        let context = warmed_up_context();
+        install_chinese_font(&context);
+        run_one_empty_frame(&context);
+        assert!(
+            font_is_installed(&context),
+            "the embedded font must be installed on iOS"
+        );
+        for character in "百花客户端，。！？".chars() {
             assert!(
-                character_is_rendered_with_a_real_glyph(
-                    &context,
-                    FontFamily::Proportional,
-                    character
-                ),
-                "设置按钮上的 {character:?} 必须画出真字形，而不是豆腐块"
+                has_real_glyph(&context, FontFamily::Proportional, character),
+                "{character:?} must shape into a real glyph with the embedded font"
             );
         }
     }
@@ -799,7 +828,7 @@ mod font_tests {
 
 #[cfg(test)]
 mod theme_contrast_tests {
-    use super::{Skin, contrasting_foreground};
+    use super::{Skin, contrasting_text};
     use baihua_core::config::{Palette, ThemeColor};
     use egui::{Color32, Context};
 
@@ -828,36 +857,38 @@ mod theme_contrast_tests {
         palette
     }
 
-    /// regression for feedback "text in the input field matches the input field background color, making it hard to read".
-    ///
-    /// the input field background color is the app background color, and egui uses `selection.stroke.color` as "the color of selected text",
-    /// previously this was filled with the app background color directly, so the selected text in the input field was identical to the input field background, making it directly invisible.
+    /// Regression for "the selected text matches the input box fill": egui paints
+    /// it with `selection.stroke.color`, which must contrast with the selection.
     #[test]
-    fn selected_text_never_blends_into_its_background() {
+    fn selection_contrast() {
         for (name, palette) in [("light", light_palette()), ("dark", dark_palette())] {
             let skin = Skin::from(&palette);
             let context = Context::default();
             skin.apply_to(&context);
-            // `set_visuals` writes to "the current theme" variant; reads back should also read the same variant
+            // `set_visuals_of` writes one variant per theme; read back the same one.
             let visuals = context.style_of(context.theme()).visuals.clone();
             let selected_text = visuals.selection.stroke.color;
             let selection_background = visuals.selection.bg_fill;
+            assert_eq!(
+                selection_background, skin.own_username_text,
+                "the {name} theme must paint selections in the own-message bubble color"
+            );
             let difference = brightness(selected_text).abs_diff(brightness(selection_background));
             assert!(
                 difference >= 128,
-                "{name} 主题里选中文字与选中底色太接近：文字 {selected_text:?}、底色 {selection_background:?}"
+                "the {name} theme keeps selected text too close to the selection background: text {selected_text:?}, background {selection_background:?}"
             );
             assert_ne!(
                 selected_text, skin.app_background,
-                "{name} 主题里选中文字不能再用应用背景色（那就是输入框底色）"
+                "in the {name} theme the selected text color must no longer be the application background (that is the input box fill)"
             );
         }
     }
 
-    /// light themes must use the light baseline: otherwise "derived" colors like button backgrounds and widget text are still from the dark theme,
-    /// resulting in dark text on dark backgrounds (before the fix, the light theme button background was #3C3C3C and text was #2B2B2B)
+    /// A light theme must use the light egui baseline and a dark one the dark
+    /// baseline, otherwise derived widget colors stay dark-on-dark.
     #[test]
-    fn light_theme_uses_light_widgets_and_dark_theme_uses_dark_ones() {
+    fn widget_lightness() {
         for (name, palette, want_light) in [
             ("light", light_palette(), true),
             ("dark", dark_palette(), false),
@@ -871,36 +902,32 @@ mod theme_contrast_tests {
                 .widgets
                 .inactive
                 .weak_bg_fill;
-            let is_light = brightness(widget_background) >= 128;
             assert_eq!(
-                is_light, want_light,
-                "{name} 主题的控件底色明暗不对：实际 {widget_background:?}"
+                brightness(widget_background) >= 128,
+                want_light,
+                "the {name} theme has the wrong lightness for the widget background: {widget_background:?}"
             );
         }
     }
 
-    /// pick a foreground color for colors "used as backgrounds": light backgrounds pair with black text, dark backgrounds pair with white text
+    /// The helper behind every derived text color: light backgrounds pair with
+    /// black text, dark backgrounds with white.
     #[test]
-    fn contrasting_foreground_picks_readable_text() {
+    fn contrast_is_readable() {
         assert_eq!(
-            contrasting_foreground(Color32::from_rgb(0xFF, 0xD5, 0x4F)),
+            contrasting_text(Color32::from_rgb(0xFF, 0xD5, 0x4F)),
             Color32::BLACK
         );
         assert_eq!(
-            contrasting_foreground(Color32::from_rgb(0x4A, 0x6F, 0xA5)),
+            contrasting_text(Color32::from_rgb(0x4A, 0x6F, 0xA5)),
             Color32::WHITE
         );
     }
 
-    /// regression fix for "buttons still use egui default appearance before the first language or appearance theme switch" and the issues it causes
-    /// "buttons only have borders on hover" and "input field text matches input field background color".
-    ///
-    /// root cause is the theme only writes into egui's current variant: on startup the theme preference is "follow system" and the system brightness isn't known yet,
-    /// the dark variant gets written in, and what really takes effect later might switch to the light variant (still egui default appearance).
-    /// here we assert both dark and light variants: panel background, input field background (`extreme_bg_color`), and
-    /// button normal background all come from the theme, and the button normal border width is greater than 0 (border is present by default).
+    /// Both style variants must carry the theme at startup (panel, input, button
+    /// fill and border); writing only the current one left egui defaults visible.
     #[test]
-    fn theme_is_written_into_both_styles_and_buttons_keep_their_border() {
+    fn theme_in_both_styles() {
         for (name, palette) in [("light", light_palette()), ("dark", dark_palette())] {
             let skin = Skin::from(&palette);
             let context = Context::default();
@@ -909,52 +936,51 @@ mod theme_contrast_tests {
                 let visuals = context.style_of(theme).visuals.clone();
                 assert_eq!(
                     visuals.panel_fill, skin.app_background,
-                    "{name} 主题在 {theme:?} 那一份样式里没生效"
+                    "the {name} theme did not take effect in its {theme:?} style"
                 );
                 assert_eq!(
                     visuals.extreme_bg_color, skin.app_background,
-                    "输入框底色要跟主题走，否则会和主题里的文字色撞成一片"
+                    "the field fill must follow the theme or it collides with the theme text color"
                 );
                 assert_eq!(
                     visuals.widgets.inactive.weak_bg_fill, skin.app_background,
-                    "{name} 主题的按钮常态底色要来自主题"
+                    "the {name} theme must supply the resting button fill"
                 );
                 assert_eq!(
                     visuals.widgets.inactive.bg_fill, skin.app_background,
-                    "{name} 主题的复选框（设置里的开关）底色也要来自主题，\
-                     否则它还是 egui 自己的灰底，和主题给的边框撞在一起就看不见边框"
+                    "the {name} theme switch fill must also come from the theme, else it stays the egui gray and the themed border disappears into it"
                 );
                 assert!(
                     visuals.widgets.inactive.bg_stroke.width > 0.0,
-                    "{name} 主题在 {theme:?} 那一份样式里按钮常态没有边框（只剩悬停才有）"
-                );
-                assert_eq!(
-                    visuals.widgets.inactive.bg_stroke.color, skin.room_border,
-                    "按钮常态边框的颜色要来自主题"
+                    "the {name} theme leaves the resting button borderless in its {theme:?} style"
                 );
             }
         }
     }
 
-    /// render-level counterpart: after applying the theme, a button with the **mouse not over it** must draw a border this frame.
-    ///
-    /// the assertion above checks "whether there is a border in the style"; this one checks "whether it is actually drawn":
-    /// button normal background is the same as panel background, so the only thing distinguishing the button from the background is this border.
-    /// when asserting only at the style level, regressions like "style is correct but didn't take effect in the actual variant" would be missed.
+    /// Render-level counterpart: a resting button and switch must really paint the
+    /// theme border (and the switch its fill) this frame, which styles cannot show.
     #[test]
-    fn a_button_paints_its_border_without_being_hovered() {
-        fn stroked_rect_colors(context: &Context) -> Vec<Color32> {
+    fn resting_borders() {
+        fn stroked_rects(context: &Context, label: &str, switch: bool) -> Vec<(Color32, Color32)> {
+            let mut checked = false;
             let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                let _ = ui.button("确认");
+                if switch {
+                    let _ = ui.checkbox(&mut checked, label);
+                } else {
+                    let _ = ui.button(label);
+                }
             });
-            // `run_ui` returns the result directly, with no other consumer for the texture delta;
-            // if not cleared, `TexturesDelta` panics on drop (egui's convention).
+            // Nothing else consumes the texture delta, and egui panics when a
+            // `TexturesDelta` is dropped uncleared.
             output.textures_delta.clear();
             output
                 .shapes
                 .into_iter()
                 .filter_map(|clipped| match clipped.shape {
-                    egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => Some(rect.stroke.color),
+                    egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
+                        Some((rect.stroke.color, rect.fill))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -962,49 +988,28 @@ mod theme_contrast_tests {
         let context = Context::default();
         let skin = Skin::from(&Palette::built_in());
         skin.apply_to(&context);
-        let colors = stroked_rect_colors(&context);
+        let buttons: Vec<Color32> = stroked_rects(&context, "confirm", false)
+            .into_iter()
+            .map(|(border, _fill)| border)
+            .collect();
         assert!(
-            colors.contains(&skin.room_border),
-            "常态按钮这一帧应当画出主题色的描边（实际描边颜色 {colors:?}，期望含 {:?}）",
+            buttons.contains(&skin.room_border),
+            "a resting button must paint the themed border this frame (borders {buttons:?}, want {:?})",
             skin.room_border
         );
-    }
-
-    /// the display switches in the settings panel (`ui.checkbox`) must also draw a border this frame with the **mouse not over them**.
-    ///
-    /// checkbox box background takes `bg_fill`, border takes `bg_stroke`: previously the theme only wrote `weak_bg_fill`,
-    /// the box background is still egui's own gray, looking "no border". This assertion both verifies the theme border is truly drawn,
-    /// and also asserts the box background is indeed from the theme (when the background doesn't match, the border has no contrast to be visible).
-    #[test]
-    fn a_settings_switch_paints_its_border_without_being_hovered() {
-        let context = Context::default();
-        let skin = Skin::from(&Palette::built_in());
-        skin.apply_to(&context);
-        let mut checked = false;
-        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            let _ = ui.checkbox(&mut checked, "显示 UID");
-        });
-        // same convention as the button one: clear the texture delta before letting the output drop when there is no other consumer
-        output.textures_delta.clear();
-        let mut painted_borders: Vec<Color32> = Vec::new();
-        let mut painted_fills: Vec<Color32> = Vec::new();
-        for clipped in output.shapes {
-            let egui::Shape::Rect(rect) = clipped.shape else {
-                continue;
-            };
-            if rect.stroke.width > 0.0 {
-                painted_borders.push(rect.stroke.color);
-                painted_fills.push(rect.fill);
-            }
-        }
+        let switches = stroked_rects(&context, "show user id", true);
         assert!(
-            painted_borders.contains(&skin.room_border),
-            "常态开关这一帧应当画出主题色的描边（实际描边颜色 {painted_borders:?}，期望含 {:?}）",
+            switches
+                .iter()
+                .any(|(border, _)| *border == skin.room_border),
+            "a resting switch must paint the themed border this frame (rects {switches:?}, want {:?})",
             skin.room_border
         );
         assert!(
-            painted_fills.contains(&skin.app_background),
-            "开关方框的底色要来自主题（实际 {painted_fills:?}，期望含 {:?}）",
+            switches
+                .iter()
+                .any(|(_, fill)| *fill == skin.app_background),
+            "the switch box fill must come from the theme (rects {switches:?}, want {:?})",
             skin.app_background
         );
     }
@@ -1024,24 +1029,23 @@ mod avatar_decode_tests {
                 &mut std::io::Cursor::new(&mut encoded),
                 image::ImageFormat::Png,
             )
-            .expect("内存里编码 PNG 不会失败");
+            .expect("encoding a PNG in memory cannot fail");
         encoded
     }
 
-    /// regression for feedback "loading images blocks the main thread": the frame when bytes are first received **does not decode** —
-    /// only queue and return None (interface draws placeholder), and the texture is given only after the background thread finishes decoding.
+    /// Decoding never runs on the render thread: new bytes only queue a job, the
+    /// texture appears once the pool answers, and broken bytes stay a placeholder.
     #[test]
-    fn decoding_happens_off_the_render_thread() {
+    fn decode_pipeline() {
         let context = Context::default();
-        let bytes = sample_png();
         let mut textures = AvatarTextures::default();
+        let bytes = sample_png();
         assert!(
             textures
                 .texture(&context, "user-1", Some(&bytes), 32)
                 .is_none(),
-            "第一次遇到一份头像字节时应当先画占位块，不能在渲染线程里解码"
+            "the first time avatar bytes appear a placeholder must be painted"
         );
-        // keep drawing the placeholder until the background thread finishes; after it finishes (wait up to 5 seconds) the texture should be available
         let mut handle = None;
         for _ in 0..500 {
             if let Some(texture) = textures.texture(&context, "user-1", Some(&bytes), 32) {
@@ -1052,28 +1056,20 @@ mod avatar_decode_tests {
         }
         assert!(
             handle.is_some(),
-            "后台线程解码完成后应当给出贴图（同尺寸只解一次）"
+            "once the pool finishes decoding a texture must appear (each size decodes once)"
         );
-    }
-
-    /// bytes that can't decode (bad files) must not be re-queued every frame, and must not cause the interface to error:
-    /// keep giving the placeholder, and the second call does not re-queue
-    #[test]
-    fn broken_image_stays_a_placeholder_without_requeueing() {
-        let context = Context::default();
-        let bytes = "这不是图片".as_bytes().to_vec();
-        let mut textures = AvatarTextures::default();
+        let broken = "this is not an image".as_bytes().to_vec();
         assert!(
             textures
-                .texture(&context, "user-2", Some(&bytes), 32)
+                .texture(&context, "user-2", Some(&broken), 32)
                 .is_none()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
             textures
-                .texture(&context, "user-2", Some(&bytes), 32)
+                .texture(&context, "user-2", Some(&broken), 32)
                 .is_none(),
-            "坏图片永远只有占位块"
+            "a broken image only ever gets the placeholder"
         );
     }
 }

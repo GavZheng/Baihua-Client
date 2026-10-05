@@ -1,23 +1,160 @@
 [package]
 name = "baihua-client-gui"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
+authors = ["ChepleBob30 <cheple_bob@outlook.com>"]
 edition = "2024"
+
+[lib]
+# `cdylib` is the shape Android (cargo-apk) loads; `staticlib` is the library the
+# iOS Xcode runner links; `rlib` lets the desktop binary and the tests share the
+# exact same code (the entry points live in `src/lib.rs`).
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 # The executable is named `baihua-gui` (matching the installer, the `baihua gui`
 # launcher and the release workflow); the package name stays `baihua-client-gui`.
+# cargo-apk must be run as `cargo apk build --lib` (see BUILDING.md section 5.2).
 name = "baihua-gui"
 path = "src/main.rs"
 
 [dependencies]
 baihua-core = { path = "../baihua-core" }
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui = "0.36.1"
+emath = "0.36.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde_json = "1"
 tungstenite = "0.30.0"
-http = "1"
 chrono = { version = "0.4.45", features = ["clock"] }
-notify-rust = "4"
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 x25519-dalek = { version = "3", features = ["static_secrets"] }
+
+# The renderer back end is chosen per operating system: `glow` everywhere except
+# iOS, where only `wgpu` builds. The android-native-activity feature is harmless
+# on desktops (winit gates it to Android) and is what lets cargo-apk load this
+# crate as a native activity.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+eframe = { version = "0.36.1", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+    "android-native-activity",
+    # "persistence" is what makes eframe call `App::save` when Android suspends
+    # the activity: swiping the app away in the recents list kills the process
+    # without ever reaching `on_exit`, and the session token plus preferences
+    # were lost (the reported bug). `save` fires on that suspend, before the kill.
+    "persistence",
+] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+eframe = { version = "0.36.1", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    # see the Android note above: `App::save` needs the persistence feature
+    "persistence",
+] }
+# The platform layer in `src/ios_platform.rs` talks straight to
+# UIKit/UserNotifications through `objc2`: the Return key of the soft keyboard
+# and the system notification back end both live there. The versions are
+# pinned to the family egui-winit already links (objc2 0.6.x /
+# objc2-foundation 0.3.x) so class and runtime types line up with the rest of
+# the graph; `block2` is the Objective-C block bridge the notification
+# completion handlers need.
+objc2 = { version = "0.6", default-features = false, features = ["std", "exception"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "UIApplication", "UIResponder", "UIScene"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationSettings",
+    "UNNotificationRequest",
+    "UNNotificationSound",
+    "UNNotification",
+    "UNNotificationTrigger",
+] }
+block2 = { version = "0.6", default-features = false, features = ["alloc"] }
+
+# `build.rs` stamps the Windows executable with the icon and version metadata.
+# The crate is unconditional because a build script sees the host's `cfg`, while
+# the stamping itself is gated by `CARGO_CFG_TARGET_OS` inside `build.rs`.
+[build-dependencies]
+winresource = "0.1"
+
+# Desktop-only: system notification daemon/bus integration, and the operating
+# system's own file dialog used by the avatar picker (no native dialog on phones).
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+notify-rust = "4"
+rfd = "0.15"
+
+# Android-only: the activity handle (`AndroidApp`) drives the window tuning
+# (soft-keyboard resize, status-bar measurement) and the JNI notification
+# back end in `src/android_platform.rs`; `jni`/`ndk-context` are the same
+# versions android-activity itself uses, so object types line up.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+android-activity = { version = "0.6", default-features = false, features = ["native-activity"] }
+# jni 0.21 (not 0.22): 0.22 is a full redesign (closure-based
+# attach, Env/EnvUnowned split); 0.21 keeps the guard-based API used by
+# `android_platform.rs`. It coexists with android-activity's 0.22 in the graph
+# (no jni types cross that boundary -- only Rust closures and raw pointers).
+jni = "0.21"
+ndk-context = "0.1"
+
+
+# The cargo-apk packaging block (manifest, icons, permissions). Regenerate the
+# five launcher mipmaps after changing assets/images/icon.png: see BUILDING.md 5.3.
+[package.metadata.android]
+package = "com.baihua.client.gui"
+# The aapt resource overlay lives under `assets/` (launcher mipmaps +
+# hand-written theme) so git tracks it: a `**/android` ignore rule used to
+# swallow the old `android/res` location (negation patterns cannot re-include
+# files under an ignored directory -- those six files were never actually
+# tracked). See BUILDING.md 5.3 for regenerating the mipmaps.
+resources = "assets/android/res"
+# INTERNET for the sockets; POST_NOTIFICATIONS is the runtime permission the
+# heads-up message notifications need on Android 13+ (requested at startup).
+uses_permission = [
+    { name = "android.permission.INTERNET" },
+    { name = "android.permission.POST_NOTIFICATIONS" },
+]
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+# 34 on purpose: targetSdkVersion 35 and above force edge-to-edge on Android 15+,
+# which puts the top bar under the status bar and the notch (unclickable) and
+# makes `adjustResize` stop resizing the window under the soft keyboard. The
+# custom theme (assets/android/res/values/styles.xml) hides the action bar and enables
+# keyboard-resize; revisit together with real inset plumbing before raising this.
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Baihua"
+icon = "@mipmap/ic_launcher"
+theme = "@style/Baihua"
+# Plain `ws://` servers on the local network stay reachable during testing.
+uses_cleartext_traffic = true
+
+[package.metadata.android.application.activity]
+# Orientation stays unspecified so the phone can rotate, and all listed config
+# changes are absorbed by the app instead of restarting it (the keyboard
+# show/hide cycle is a config change). Keyboard-resize cannot live here:
+# ndk-build's activity metadata has no `windowSoftInputMode` field, so
+# `src/android_platform.rs` applies SOFT_INPUT_ADJUST_RESIZE to the live window
+# at startup instead.
+config_changes = "orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|smallestScreenSize|density"
+resizeable_activity = true
+
+# cargo-bundle (macOS .app/.dmg): paths resolve against the current working
+# directory, so run `cargo bundle` from the repository root. See BUILDING.md 2.
+[package.metadata.bundle]
+name = "Baihua"
+identifier = "com.baihua.client.gui"
+icon = ["baihua-client-gui/assets/baihua.icns"]
+version = "0.1.0"
+copyright = "Copyright (c) ChepleBob 2026"
+category = "Communication"
+short_description = "Baihua instant messenger, graphical client"
+osx_minimum_system_version = "10.15"
+resources = ["config:Resources/config"]

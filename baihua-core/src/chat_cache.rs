@@ -1,7 +1,7 @@
 //! Local cache for chat messages.
 //!
 //! The on-disk location is a client cache subdirectory under the same directory tree as the server:
-//! `<$BAIHUA_DIR|~/.baihua>/client/cache/chat_msg/<用户 ID>/<房间 ID>.json`，
+//! `<$BAIHUA_DIR|~/.baihua>/client/cache/chat_msg/<user id>/<room id>.json`.
 //! Isolated by user to prevent multiple accounts on the same machine from seeing each other's chat records.
 //!
 //! Cache boundary (security premise): only cache messages from unencrypted rooms. Plaintext for end-to-end encrypted private chats exists only in memory,
@@ -214,32 +214,43 @@ mod tests {
 
     fn temporary_cache(label: &str) -> ChatCache {
         let directory = std::env::temp_dir().join(format!("baihua-cache-{label}"));
-        std::fs::create_dir_all(&directory).expect("临时缓存目录应可创建");
+        std::fs::create_dir_all(&directory)
+            .expect("the temporary cache directory must be creatable");
         ChatCache { directory }
     }
 
     #[test]
     fn merge_keeps_existing_copy_of_duplicated_message_ids() {
-        let existing = vec![message("1", "room", "2026-01-01T00:00:00Z", "本地明文")];
+        let existing = vec![message(
+            "1",
+            "room",
+            "2026-01-01T00:00:00Z",
+            "local plaintext",
+        )];
         let incoming = vec![
-            message("1", "room", "2026-01-01T00:00:00Z", "服务端密文占位"),
-            message("2", "room", "2026-01-01T00:01:00Z", "新消息"),
+            message(
+                "1",
+                "room",
+                "2026-01-01T00:00:00Z",
+                "server ciphertext placeholder",
+            ),
+            message("2", "room", "2026-01-01T00:01:00Z", "new message"),
         ];
         let merged = merge_by_id(&existing, &incoming);
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].content, "本地明文");
+        assert_eq!(merged[0].content, "local plaintext");
         assert_eq!(merged[1].id, "2");
     }
 
     #[test]
     fn sorting_orders_by_creation_time_then_identifier() {
         let mut messages = vec![
-            message("b", "room", "2026-01-02T00:00:00Z", "后"),
-            message("a", "room", "2026-01-01T00:00:00Z", "先"),
+            message("b", "room", "2026-01-02T00:00:00Z", "later"),
+            message("a", "room", "2026-01-01T00:00:00Z", "earlier"),
         ];
         sort_messages(&mut messages);
-        assert_eq!(messages[0].content, "先");
-        assert_eq!(messages[1].content, "后");
+        assert_eq!(messages[0].content, "earlier");
+        assert_eq!(messages[1].content, "later");
     }
 
     #[test]
@@ -249,15 +260,17 @@ mod tests {
         cache.store_room(
             room_id,
             &[
-                message("2", room_id, "2026-01-02T00:00:00Z", "第二条"),
-                message("1", room_id, "2026-01-01T00:00:00Z", "第一条"),
+                message("2", room_id, "2026-01-02T00:00:00Z", "second entry"),
+                message("1", room_id, "2026-01-01T00:00:00Z", "first entry"),
             ],
             Some("1"),
             true,
         );
-        let cached = cache.load_room(room_id).expect("应能读回刚写入的缓存");
+        let cached = cache
+            .load_room(room_id)
+            .expect("a freshly written cache must read back");
         assert_eq!(cached.messages.len(), 2);
-        assert_eq!(cached.messages[0].content, "第一条");
+        assert_eq!(cached.messages[0].content, "first entry");
         assert_eq!(cached.older_cursor.as_deref(), Some("1"));
         assert!(cached.has_more);
         cache.forget_room(room_id);
@@ -271,15 +284,17 @@ mod tests {
         let room_id = "room-append";
         cache.store_room(
             room_id,
-            &[message("1", room_id, "2026-01-01T00:00:00Z", "旧")],
+            &[message("1", room_id, "2026-01-01T00:00:00Z", "old")],
             None,
             false,
         );
         cache.append_messages(
             room_id,
-            &[message("2", room_id, "2026-01-02T00:00:00Z", "新")],
+            &[message("2", room_id, "2026-01-02T00:00:00Z", "new")],
         );
-        let cached = cache.load_room(room_id).expect("追加后仍应读到缓存");
+        let cached = cache
+            .load_room(room_id)
+            .expect("the cache must still be readable after appending");
         assert_eq!(cached.messages.len(), 2);
         assert_eq!(cached.older_cursor, None);
         assert!(!cached.has_more);

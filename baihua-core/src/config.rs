@@ -182,6 +182,8 @@ pub struct Palette {
     pub search_current_match_background: ThemeColor,
     /// Read/unread status text color below messages
     pub read_state_text: ThemeColor,
+    /// Color the button images are tinted with: the shipped images are pure white
+    pub icon_color: ThemeColor,
 }
 
 /// Result of loading a theme: theme content + whether there are missing slots + unknown field names in the theme file.
@@ -195,14 +197,14 @@ pub struct ThemeFile {
 }
 
 impl Palette {
-    /// Built-in default appearance: identical to the hardcoded color scheme before the appearance system was introduced,
-    /// and also serves as the fallback color when a theme file has missing slots, ensuring users without a configured theme see the original effect.
+    /// Built-in fallback palette: the same colors as the shipped `themes/default.json` (neither side
+    /// may drift); a theme file with missing slots falls back to these colors.
     pub fn built_in() -> Self {
         Self {
-            app_background: ThemeColor::Default,
-            message_border: ThemeColor::Cyan,
-            room_border: ThemeColor::Cyan,
-            overlay_border: ThemeColor::Cyan,
+            app_background: ThemeColor::Rgb(43, 48, 56),
+            message_border: ThemeColor::Rgb(91, 107, 125),
+            room_border: ThemeColor::Rgb(91, 107, 125),
+            overlay_border: ThemeColor::Rgb(107, 122, 141),
             message_text: ThemeColor::White,
             selected_text: ThemeColor::Yellow,
             other_username_text: ThemeColor::Cyan,
@@ -211,7 +213,7 @@ impl Palette {
             hint_text: ThemeColor::DarkGray,
             notice_hint_border: ThemeColor::Blue,
             notice_error_border: ThemeColor::Red,
-            input_border: ThemeColor::Cyan,
+            input_border: ThemeColor::Rgb(91, 107, 125),
             input_text: ThemeColor::White,
             command_border: ThemeColor::Yellow,
             search_border: ThemeColor::Red,
@@ -219,11 +221,30 @@ impl Palette {
             search_match_background: ThemeColor::Red,
             search_current_match_background: ThemeColor::LightYellow,
             read_state_text: ThemeColor::Blue,
+            icon_color: ThemeColor::Rgb(147, 165, 184),
         }
     }
 
+    /// The name of the default appearance: what every client starts with when the person has never
+    /// picked a theme file, and what `preferences.json` stores for that state. Unlike the retired
+    /// reserved name, it is not a code-only appearance — it is an ordinary theme file
+    /// (`config/themes/default.json`) shipped with the configuration directory, so loading it goes
+    /// through the regular file path and the settings panel lists it like any other theme.
+    /// Everything that compares an appearance name against "the default one" must use this function
+    /// instead of writing the literal out again.
+    pub fn default_name() -> &'static str {
+        "default"
+    }
+
     /// Read `<config_dir>/themes/{name}.json` and return the complete theme at once.
-    /// When the file is unreadable or not valid JSON, return the built-in default theme and mark "missing field" as true.
+    /// When the file is unreadable or not valid JSON, return the built-in fallback colors and mark
+    /// "missing field" as true.
+    ///
+    /// There is no reserved name any more: the default appearance (`default_name`) is an ordinary
+    /// theme file shipped under `config/themes`, so it is loaded through this same file path like
+    /// every other theme. The retired reserved name `built_in` has no theme file by design and is
+    /// therefore reported as incomplete — an old `preferences.json` still holding that value gets a
+    /// clear notice instead of silent special-casing.
     pub fn load(name: &str) -> ThemeFile {
         let palette = Self::built_in();
         let path = paths::config_path(&format!("themes/{name}.json"));
@@ -243,7 +264,7 @@ impl Palette {
         };
         let mut loaded = palette;
         let mut has_missing_field = false;
-        let fields: [&str; 20] = [
+        let fields: [&str; 21] = [
             "app_background",
             "message_border",
             "room_border",
@@ -264,6 +285,7 @@ impl Palette {
             "search_match_background",
             "search_current_match_background",
             "read_state_text",
+            "icon_color",
         ];
         for field in fields {
             match document.get(field).and_then(parse_theme_color) {
@@ -313,13 +335,19 @@ impl Palette {
             "search_match_background" => self.search_match_background = color,
             "search_current_match_background" => self.search_current_match_background = color,
             "read_state_text" => self.read_state_text = color,
+            "icon_color" => self.icon_color = color,
             _ => {}
         }
     }
 
-    /// List all available appearance names under config/themes (removing .json suffix), sorted alphabetically
+    /// List all available appearance names: the theme files under `config/themes` (`.json` suffix
+    /// removed), sorted alphabetically and deduplicated.
+    ///
+    /// Every entry is backed by a real theme file — nothing is injected from code any more. The
+    /// default appearance is reachable through its shipped file `themes/default.json`, so the
+    /// settings panel and `/appearance <name>` can always switch back to it without a reserved name.
     pub fn available_names() -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(paths::config_directory().join("themes"))
+        let mut file_names: Vec<String> = fs::read_dir(paths::config_directory().join("themes"))
             .into_iter()
             .flatten()
             .filter_map(|entry| entry.ok())
@@ -338,8 +366,9 @@ impl Palette {
                     .map(|stem| stem.to_string())
             })
             .collect();
-        names.sort();
-        names
+        file_names.sort();
+        file_names.dedup();
+        file_names
     }
 }
 
@@ -353,14 +382,14 @@ pub struct Language {
     texts: HashMap<String, String>,
 }
 
-/// 读一份语言文件，把里面的条目并进已经读到的表里。
+/// Read one language file and merge its entries into the table collected so far.
 ///
-/// 合并规则是"先生效的键优先"：调用方按配置目录候选顺序一份份喂进来，
-/// 排在前面的文件（用户配置目录那一份）已经有的键保持原样，只补它缺的键。
-/// 这样用户改过的文案不会被后一份冲掉，后一份多出来的新条目又能补进来。
+/// The merge rule is "the first file that supplied a key wins": callers feed files in
+/// candidate-directory order, keys already present from an earlier file (the user's own
+/// copy) are kept untouched, and only missing keys are filled in — user edits survive while new entries still arrive.
 ///
-/// 返回值是"这份文件有没有真的读出一张表"：文件不存在、打不开、
-/// 或者 JSON 根节点不是"键 → 文本"的对象（比如写成了一个数组）都算没读到。
+/// The return value answers "did this file really yield a table": a missing file, an unreadable file,
+/// or a JSON root that is not a "key to text" object (an array, say) all count as "did not read".
 fn merge_language_text_file(path: &Path, texts: &mut HashMap<String, String>) -> bool {
     let Ok(content) = fs::read_to_string(path) else {
         return false;
@@ -385,14 +414,14 @@ impl Language {
 
     /// Read `<config_dir>/languages/{code}.json` and return the whole text table at once.
     ///
-    /// 语言文件按 `paths::config_directory_candidates()` 的顺序**逐份合并**，不是只读第一份：
-    /// 用户配置目录里的那份排在前面（用户改过的条目以它为准），
-    /// 排在后面的源码树/安装目录那份只用来补齐前面缺的条目。
-    /// 旧版本安装出来的 `languages/*.json` 会一直留在用户目录里（安装器只补缺失的文件、不重写已有文件），
-    /// 新版本加进来的键在那一份里根本没有，界面上就会把键名当文案显示出来（"大量文本变成占位符"的根因）。
-    /// 一份都读不到（文件不存在或不是"键 → 文本"的对象）时返回**出错的那份文件路径**，
-    /// 不返回任何写好的文案：提示文字由各界面按自己的语言表补
-    /// （图形版用语言键 `error_lang_file_read`），核心层不产出某一种语言的用户文案。
+    /// Language files are **merged file by file** in `paths::config_directory_candidates()` order, not "first file wins":
+    /// the copy in the user's configuration directory comes first (its entries are authoritative),
+    /// and the source-tree / installed copy behind it only fills the gaps.
+    /// A `languages/*.json` installed by an older version stays in the user directory forever (the installer only adds missing files, never rewrites),
+    /// so keys introduced by a newer version are absent there and the interface would show raw keys — the root cause of "most texts turned into placeholders".
+    /// When no file can be read (missing, or not a "key to text" object) it returns **the path of the offending file**,
+    /// never canned prose: each interface localizes the complaint through its own table
+    /// (the graphical version uses the key `error_lang_file_read`); the core layer produces no user text in one language.
     pub fn load(code: &str) -> Result<Self, PathBuf> {
         let relative_path = format!("languages/{code}.json");
         let files: Vec<PathBuf> = paths::config_directory_candidates()
@@ -626,9 +655,16 @@ pub fn drop_cached_avatar(user_id: &str) {
     }
 }
 
-/// Debug log: only written in debug builds. Written to a fixed file under `/tmp`,
-/// making it easy for users to send the file when encountering problems without having to reproduce them (append-only, silently ignored on failure).
-#[cfg(debug_assertions)]
+/// Debug log: written in debug builds and in every mobile release build (the
+/// phone is the one place a developer cannot attach a debugger to).
+///
+/// The location follows the client root: on desktops (no `BAIHUA_DIR` override)
+/// it stays the familiar fixed `/tmp` file, while on mobile -- where `BAIHUA_DIR`
+/// points into the app's private directory -- the log lands in that sandbox,
+/// which is the only place a phone can write and the only place a developer can
+/// pull from the device (Android has no `/tmp`, so those writes used to vanish
+/// without a trace and left the black-screen reports with no evidence at all).
+#[cfg(any(debug_assertions, target_os = "android", target_os = "ios"))]
 pub fn debug_log(message: &str) {
     use std::sync::Mutex;
     static LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -636,34 +672,52 @@ pub fn debug_log(message: &str) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let path = std::path::Path::new("/tmp/baihua_client_debug.log");
     let line = format!("{}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(debug_log_path())
+    {
         let _ = writeln!(file, "{line} {message}");
     }
 }
 
-#[cfg(not(debug_assertions))]
+/// Where `debug_log` appends: `<BAIHUA_DIR>/client/debug.log` when the
+/// environment override is present (the mobile sandbox sets it at startup), the
+/// historical `/tmp/baihua_client_debug.log` otherwise (desktops: the location
+/// developers already know, unchanged).
+#[cfg(any(debug_assertions, target_os = "android", target_os = "ios"))]
+fn debug_log_path() -> std::path::PathBuf {
+    match std::env::var_os("BAIHUA_DIR").filter(|value| !value.is_empty()) {
+        Some(root) => std::path::PathBuf::from(root)
+            .join("client")
+            .join("debug.log"),
+        None => std::path::PathBuf::from("/tmp/baihua_client_debug.log"),
+    }
+}
+
+#[cfg(not(any(debug_assertions, target_os = "android", target_os = "ios")))]
 pub fn debug_log(_message: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Language, merge_language_text_file};
+    use super::{Language, Palette, merge_language_text_file};
+    use crate::paths;
     use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::path::PathBuf;
 
-    /// 一件临时场地：放几份语言文件，测"多份合并"时不碰真实配置目录
+    /// A staging area: drop a few language files here so "merge several files" tests never touch the real config
     fn staging_area(label: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!("baihua-language-{label}"));
         let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("临时目录应可创建");
+        fs::create_dir_all(&directory).expect("the staging directory must be creatable");
         directory
     }
 
-    /// 本轮修复"大量文本无法读取语言文件，显示占位符"的核心：
-    /// 用户配置目录里那份语言文件是旧版本留下的（缺新条目），
-    /// 合并后新条目要由随程序发布的那一份补齐，而用户自己改过的条目不能被冲掉。
+    /// The core of the "most texts fell back to placeholder keys" fix:
+    /// the language file in the user directory comes from an older install (new keys missing),
+    /// so the merged table must fill new keys from the shipped file while the user's own edits survive.
     #[test]
     fn a_later_language_file_fills_the_entries_an_earlier_one_is_missing() {
         let staging = staging_area("merge");
@@ -671,72 +725,134 @@ mod tests {
         let shipped_file = staging.join("shipped-zh-CN.json");
         fs::write(
             &user_file,
-            "{\"page_login\":\"我改过的登录\",\"page_register\":\"注册\"}",
+            "{\"page_login\":\"my edited login\",\"page_register\":\"register\"}",
         )
-        .expect("写入用户那份应成功");
+        .expect("writing the user copy must succeed");
         fs::write(
             &shipped_file,
-            "{\"page_login\":\"登录\",\"page_register\":\"注册\",\"message_input_placeholder\":\"输入消息\"}",
+            "{\"page_login\":\"log in\",\"page_register\":\"register\",\"message_input_placeholder\":\"type a message\"}",
         )
-        .expect("写入随程序发布的那份应成功");
+        .expect("writing the shipped copy must succeed");
 
         let mut texts: HashMap<String, String> = HashMap::new();
         assert!(
             merge_language_text_file(&user_file, &mut texts),
-            "用户那份要算读到了"
+            "the user copy must count as read"
         );
         assert!(
             merge_language_text_file(&shipped_file, &mut texts),
-            "随程序发布的那份要算读到了"
+            "the shipped copy must count as read"
         );
         assert_eq!(
             texts.get("page_login").map(String::as_str),
-            Some("我改过的登录"),
-            "排在前面的文件优先，用户改过的文案不能被后一份冲掉"
+            Some("my edited login"),
+            "earlier files win; user edits must not be overwritten by the later file"
         );
         assert_eq!(
             texts.get("message_input_placeholder").map(String::as_str),
-            Some("输入消息"),
-            "前面缺的条目要由后面的文件补上，否则界面上会显示成键名占位符"
+            Some("type a message"),
+            "entries missing from the first file must be filled by the later one, or the interface shows key placeholders"
         );
         let _ = fs::remove_dir_all(&staging);
     }
 
-    /// 读不到的文件只跳过，不算一份语言文件；根节点不是"键 → 文本"的对象也一样。
-    /// 这条保证的是"多份候选里坏一份不会把整个语言表带坏"。
+    /// An unreadable file is skipped, not counted as a language file; a non-object root is the same.
+    /// This guards "one broken file among the candidates cannot poison the whole table".
     #[test]
     fn unreadable_language_files_are_skipped() {
         let staging = staging_area("unreadable");
         let mut texts: HashMap<String, String> = HashMap::new();
         assert!(
-            !merge_language_text_file(&staging.join("不存在.json"), &mut texts),
-            "文件不存在要算没读到"
+            !merge_language_text_file(&staging.join("does-not-exist.json"), &mut texts),
+            "a missing file must count as not read"
         );
         let array_file = staging.join("array.json");
-        fs::write(&array_file, "[\"这不是一张语言表\"]").expect("写入坏格式应成功");
+        fs::write(&array_file, "[\"this is not a language table\"]")
+            .expect("writing the malformed file must succeed");
         assert!(
             !merge_language_text_file(&array_file, &mut texts),
-            "JSON 根节点不是对象要算没读到"
+            "a JSON root that is not an object must count as not read"
         );
-        assert!(texts.is_empty(), "没读到就不该往表里塞东西");
+        assert!(
+            texts.is_empty(),
+            "nothing may enter the table when nothing was read"
+        );
         let _ = fs::remove_dir_all(&staging);
     }
 
-    /// 随程序发布的语言文件必须**键集合完全一致**。
+    /// The default appearance is an **ordinary theme file** (`themes/default.json`), no longer a reserved code-built-in name:
+    /// loading it must go through the same file path as any theme, with complete fields, no extras, and colors matching the code fallback
+    /// (default.json mirrors the built-in fallback palette; neither side may drift).
+    #[test]
+    fn the_default_appearance_is_an_ordinary_complete_theme_file() {
+        let name = Palette::default_name();
+        assert!(
+            paths::config_path(&format!("themes/{name}.json")).exists(),
+            "the default appearance must really ship a theme file now, or the client reports incomplete fields at startup"
+        );
+        let theme = Palette::load(name);
+        assert!(
+            !theme.has_missing_field,
+            "the default appearance ({name}) must be complete, got {:?}",
+            theme.palette
+        );
+        assert!(
+            theme.extra_fields.is_empty(),
+            "the default appearance must not carry unknown fields"
+        );
+        assert_eq!(
+            theme.palette,
+            Palette::built_in(),
+            "the default appearance must match the code fallback palette exactly"
+        );
+    }
+
+    /// The reserved name `built_in` is gone from the appearance system: the available list **only names real theme files**,
+    /// it must no longer contain built_in and must list the default appearance through default.json;
+    /// and actually loading the name built_in must honestly report incomplete fields — no silent special cases.
+    #[test]
+    fn the_retired_reserved_name_is_gone_and_default_is_listed() {
+        let names = Palette::available_names();
+        assert!(
+            !names.iter().any(|name| name == "built_in"),
+            "built_in must no longer be an available appearance, got {names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == Palette::default_name())
+                .count(),
+            1,
+            "the default appearance must come from themes/default.json and appear exactly once: {names:?}"
+        );
+        let retired = Palette::load("built_in");
+        assert!(
+            retired.has_missing_field,
+            "loading the retired reserved name must report incomplete fields honestly (no special case left)"
+        );
+    }
+
+    /// The shipped language files must carry **exactly the same key set**.
     ///
-    /// 少写一个键的那一边，界面上会把键名当文案显示给用户（`Language::text` 找不到就回退成键名），
-    /// 这正是"英文界面里冒出一段中文/一串下划线键名"的根因；合并（条目级补缺）救不了"所有语言文件都缺这个键"。
+    /// Whichever file misses a key shows that key verbatim to users (`Language::text` falls back to the key name),
+    /// the root cause of "Chinese text or raw underscore keys leaking into the English interface"; merging (per-key fill-in) cannot help when every language file lacks the key.
     #[test]
     fn shipped_language_files_carry_the_same_keys() {
         let codes = Language::available_codes();
-        assert!(!codes.is_empty(), "config/languages 下应至少有一份语言文件");
+        assert!(
+            !codes.is_empty(),
+            "config/languages must ship at least one language file"
+        );
         let mut key_sets: Vec<(String, BTreeSet<String>)> = Vec::new();
         for code in &codes {
             let Ok(language) = Language::load(code) else {
                 continue;
             };
             let keys: BTreeSet<String> = language.texts().into_keys().collect();
-            assert!(!keys.is_empty(), "{code} 应能读出一张非空的文案表");
+            assert!(
+                !keys.is_empty(),
+                "{code} must yield a non-empty table of texts"
+            );
             key_sets.push((code.clone(), keys));
         }
         let Some((first_code, first_keys)) = key_sets.first() else {
@@ -747,7 +863,7 @@ mod tests {
             let extra: Vec<&String> = keys.difference(first_keys).collect();
             assert!(
                 missing.is_empty() && extra.is_empty(),
-                "{first_code} 与 {code} 的文案键不一致：{code} 缺 {missing:?}，多 {extra:?}"
+                "the keys of {first_code} and {code} differ: {code} lacks {missing:?}, carries extra {extra:?}"
             );
         }
     }

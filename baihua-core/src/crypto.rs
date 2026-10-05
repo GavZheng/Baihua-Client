@@ -4,9 +4,9 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-// rand 0.10 移除了 rngs::OsRng：操作系统随机源改名为 rngs::SysRng，且只实现可失败的 TryCryptoRng，
-// 须经 rand_core::UnwrapErr 包装成 dalek 系列要求的不可失败 CryptoRng（取熵失败即 panic，与原 OsRng 行为一致）；
-// 填充字节的 fill_bytes 由 rand::Rng trait 提供（原 rand::RngCore）
+// rand 0.10 removed rngs::OsRng: the operating-system random source is renamed rngs::SysRng and only implements the fallible TryCryptoRng,
+// so it must be wrapped by rand_core::UnwrapErr into the infallible CryptoRng the dalek crates require (a failed entropy draw panics, matching the old OsRng behaviour);
+// the fill_bytes method comes from the rand::Rng trait (formerly rand::RngCore)
 use rand::Rng;
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
@@ -16,8 +16,8 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 /// Encryption module error type
 ///
-/// 错误文案是给开发者看的**技术细节**，统一用英文：界面把它拼在本地化前缀后面
-/// （`format!("{}: {error}", self.text("error_key_derivation"))`），核心层不产出某一种语言的用户文案。
+/// Error texts are **technical details** aimed at developers, always in English: the interface
+/// appends them after a localized prefix (`format!("{}: {error}", self.text("error_key_derivation"))`), and the core layer never produces user-facing text in one specific language.
 #[derive(Debug, Error)]
 pub enum CryptoError {
     #[error("failed to decode the base64 data: {0}")]
@@ -41,20 +41,20 @@ pub fn encrypt_login_password(password: &str) -> String {
     let nonce = XNonce::from([0u8; 24]);
     let ciphertext = cipher
         .encrypt(&nonce, password.as_bytes())
-        .expect("固定密钥材料的确定性加密不会失败");
-    // 保持与端到端消息一致的“nonce 前缀 + 密文”结构约定
+        .expect("deterministic encryption of the fixed key material cannot fail");
+    // Keep the same "nonce prefix + ciphertext" structure the end-to-end messages use
     let mut blob = Vec::with_capacity(24 + ciphertext.len());
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
     BASE64.encode(blob)
 }
 
-/// 生成用户身份密钥对（Ed25519），每次程序启动生成一次，不持久化
+/// Generate the user identity key pair (Ed25519): once per program start, never persisted
 pub fn generate_identity_key() -> SigningKey {
     SigningKey::generate(&mut UnwrapErr(SysRng))
 }
 
-/// 生成本次会话的 X25519 临时密钥对
+/// Generate the X25519 ephemeral key pair for this session
 pub fn generate_ephemeral_secret() -> EphemeralSecret {
     EphemeralSecret::random_from_rng(&mut UnwrapErr(SysRng))
 }
@@ -157,7 +157,8 @@ fn at_rest_key() -> [u8; 32] {
 
 /// Encrypt sensitive config (login token) for static storage; decrypt via decrypt_at_rest
 pub fn encrypt_at_rest(plaintext: &str) -> String {
-    encrypt_message(&at_rest_key(), plaintext).expect("加密静态配置不会失败")
+    encrypt_message(&at_rest_key(), plaintext)
+        .expect("encrypting at-rest configuration cannot fail")
 }
 
 /// Decrypt a statically stored sensitive config; returns None when the data is corrupted or the key does not match
@@ -181,8 +182,8 @@ mod tests {
     fn message_round_trip() {
         let mut key = [0u8; 32];
         UnwrapErr(SysRng).fill_bytes(&mut key);
-        let blob = encrypt_message(&key, "你好，Baihua！").unwrap();
-        assert_eq!(decrypt_message(&key, &blob).unwrap(), "你好，Baihua！");
+        let blob = encrypt_message(&key, "Hello, Baihua!").unwrap();
+        assert_eq!(decrypt_message(&key, &blob).unwrap(), "Hello, Baihua!");
         let mut wrong_key = key;
         wrong_key[0] ^= 1;
         assert!(decrypt_message(&wrong_key, &blob).is_err());

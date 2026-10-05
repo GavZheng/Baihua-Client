@@ -34,13 +34,15 @@ pub struct InstallReport {
     pub notes: Vec<String>,
 }
 
-/// Pending install record: `/update` or `update` writes the packaged content here,
-/// then the detached installer process reads it with parameterless `install`.
-/// A file is used instead of command-line arguments because the install command does not expose parameters like --from.
+/// One pending installation: the downloaded package, the version it carries, the prefix to
+/// install into and the process whose exit the installer must wait for. A file rather than
+/// command-line arguments, because `install` deliberately takes none.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingInstall {
-    /// The unpacked directory (contains executable files, possibly config too)
-    pub staged_directory: String,
+    /// The downloaded package file: an archive, a disk image, an installer or an AppImage
+    pub package_path: String,
+    /// The version the package carries; names the staging directory and appears in reports
+    pub version: String,
     /// Which prefix to install to. Must be written by the initiator: during self-update in target/debug the build directory is replaced,
     /// but `install` running standalone uses the default prefix; the two must not be mixed
     pub prefix: String,
@@ -73,51 +75,165 @@ pub fn current_prefix() -> Option<PathBuf> {
     Some(binary_directory.to_path_buf())
 }
 
-/// Unpack and install a verified update package. The CLI `update` calls it directly (the process is not running, so it can replace immediately);
-/// the interface's /update uses spawn_detached_installer instead, letting the new process wait for this process to exit before replacing.
-pub fn apply_downloaded_archive(
-    archive_path: &Path,
-    new_version: &str,
-) -> Result<InstallReport, String> {
-    let staging_root = paths::update_directory()
-        .ok_or_else(|| "cannot locate the update directory".to_string())?;
-    let staged_directory = staging_root.join(format!("staged-{new_version}"));
-    extract_archive(archive_path, &staged_directory)?;
-    let prefix = current_prefix()
-        .or_else(default_prefix)
-        .ok_or_else(|| "cannot determine the installation prefix".to_string())?;
+/// Unpack and install a verified update package, choosing the path by package format.
+pub fn install_downloaded_package(pending: &PendingInstall) -> Result<InstallReport, String> {
+    if let Some(process_id) = pending.wait_for_process {
+        wait_for_process_to_exit(process_id);
+    }
+    let package_path = PathBuf::from(&pending.package_path);
+    let prefix = PathBuf::from(&pending.prefix);
+    let name = package_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name.ends_with(".dmg") {
+        return install_disk_image(&package_path, &prefix, &pending.version);
+    }
+    if name.ends_with(".msi") {
+        return install_windows_installer(&package_path, &prefix, &pending.version);
+    }
+    if name.ends_with(".AppImage") {
+        return install_app_image(&package_path, &prefix);
+    }
+    let staged_directory = staging_directory(&pending.version)?;
+    let source_directory = extract_archive(&package_path, &staged_directory)?;
     install(&InstallRequest {
-        source_directory: staged_directory,
+        source_directory,
         prefix,
         wait_for_process: None,
     })
 }
 
-// 客户端的三个"端"。三端各自的包只带自己那一个可执行文件，但装进的是同一个 `<前缀>/bin`。
-//
-// 名字与发布通道的对应关系（BUILDING.md 与 `.github/workflows/build-release.yml` 必须与此一致）：
-// - 命令行版：可执行文件 `baihua`（本程序，包 `baihua-cli`，标签 `cli-v<版本>`）；
-// - 图形版：可执行文件 `baihua-gui`（包 `baihua-client-gui`，标签 `gui-v<版本>`）；
-// - 终端版：可执行文件 `baihua-tui`（包 `baihua-client-tui`，标签 `tui-v<版本>`）。
-//
-// 安装时按名字判断源目录里带了哪几端：包名与可执行文件名一一对应，不猜"当前进程叫什么"。
+/// The staging directory one version unpacks into, inside the update directory.
+fn staging_directory(version: &str) -> Result<PathBuf, String> {
+    let staging_root = paths::update_directory()
+        .ok_or_else(|| "cannot locate the update directory".to_string())?;
+    Ok(staging_root.join(format!("staged-{version}")))
+}
 
-/// 命令行版（本程序）安装后的文件名；Windows 带 `.exe`
+// The client's three "ends". Each end's package carries only its own executable, yet all three install into the same `<prefix>/bin`.
+//
+// Names mapped to release channels (BUILDING.md and `.github/workflows/build-release.yml` must agree with this table):
+// - Command line end: executable `baihua` (this program, package `baihua-cli`, tag `cli-v<version>`);
+// - Graphical end: executable `baihua-gui` (package `baihua-client-gui`, tag `gui-v<version>`);
+// - Terminal end: executable `baihua-tui` (package `baihua-client-tui`, tag `tui-v<version>`).
+//
+// Installation decides which ends a source directory carries by name: package names and executable names correspond one-to-one, and "what is this process called" is never guessed.
+
+/// Installed file name of the command line end (this program); Windows appends `.exe`
 pub fn command_line_executable_name() -> String {
     executable_name("baihua")
 }
 
-/// 图形版安装后的文件名；Windows 带 `.exe`
+/// Installed file name of the graphical end; Windows appends `.exe`
 pub fn graphical_executable_name() -> String {
     executable_name("baihua-gui")
 }
 
-/// 终端版安装后的文件名；Windows 带 `.exe`
+/// The macOS application bundle the graphical disk image carries, installed as-is into an
+/// Applications directory; its shared configuration travels inside the bundle.
+pub fn application_bundle_name() -> String {
+    "Baihua.app".to_string()
+}
+
+/// The directories that hold dragged-in applications, best first (macOS only; every other
+/// platform keeps all of the graphical end inside the install prefix).
+pub fn application_bundle_directories() -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let mut directories = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(home).join("Applications"));
+    }
+    directories
+}
+
+/// The directory a fresh graphical bundle lands in: the first Applications directory that
+/// accepts writes, else the install prefix as the fallback every environment can use.
+pub fn application_install_directory() -> PathBuf {
+    let candidates = application_bundle_directories()
+        .into_iter()
+        .chain(default_prefix())
+        .collect::<Vec<PathBuf>>();
+    application_install_directory_from(&candidates)
+}
+
+/// The first candidate a file can actually be written into; when none accepts writes the
+/// last candidate (the install prefix) still receives the bundle and reports the reason.
+pub fn application_install_directory_from(candidates: &[PathBuf]) -> PathBuf {
+    for candidate in candidates {
+        if directory_accepts_writes(candidate) {
+            return candidate.clone();
+        }
+    }
+    candidates.last().cloned().unwrap_or_default()
+}
+
+/// Whether a directory exists (or can be created) and really accepts a written file.
+fn directory_accepts_writes(directory: &Path) -> bool {
+    std::fs::create_dir_all(directory).is_ok()
+        && match std::fs::File::create(directory.join(".baihua-write-test")) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(directory.join(".baihua-write-test"));
+                true
+            }
+            Err(_) => false,
+        }
+}
+
+/// The single-file Linux package of the graphical end.
+pub fn graphical_app_image_name() -> String {
+    "Baihua.AppImage".to_string()
+}
+
+/// Where the graphical end may live under a prefix, most preferred first: the legacy
+/// application bundle, the AppImage, then the bare executable a historic archive installed.
+pub fn graphical_payloads(prefix: &Path) -> Vec<PathBuf> {
+    vec![
+        prefix.join(application_bundle_name()),
+        prefix.join("bin").join(graphical_app_image_name()),
+        prefix.join("bin").join(graphical_executable_name()),
+    ]
+}
+
+/// The installed payload of one end under the prefix, or None when that end is missing.
+pub fn installed_payload(prefix: &Path, executable_name: &str) -> Option<PathBuf> {
+    if executable_name == graphical_executable_name() {
+        return graphical_payloads(prefix)
+            .into_iter()
+            .find(|payload| payload.exists());
+    }
+    let candidate = prefix.join("bin").join(executable_name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Every place the installed graphical end may be found, best first: the bundle inside
+/// each Applications directory, then the prefix payloads (legacy bundle, AppImage, file).
+pub fn graphical_application_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = application_bundle_directories()
+        .into_iter()
+        .map(|directory| directory.join(application_bundle_name()))
+        .collect();
+    if let Some(prefix) = default_prefix() {
+        candidates.extend(graphical_payloads(&prefix));
+    }
+    candidates
+}
+
+/// The installed graphical end: the first candidate that exists, or None meaning the
+/// graphical end is not installed anywhere this program recognises.
+pub fn graphical_application_path() -> Option<PathBuf> {
+    graphical_application_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+/// Installed file name of the terminal end; Windows appends `.exe`
 pub fn terminal_executable_name() -> String {
     executable_name("baihua-tui")
 }
 
-/// 三端的可执行文件名，顺序固定为命令行版、图形版、终端版（安装、卸载、版本报告都按这个顺序走）
+/// The three executable names in the fixed order command line, graphical, terminal (install, uninstall and version reports all follow it)
 pub fn installed_executable_names() -> Vec<String> {
     vec![
         command_line_executable_name(),
@@ -126,7 +242,7 @@ pub fn installed_executable_names() -> Vec<String> {
     ]
 }
 
-/// 三端各自的可执行文件名与它对应的发布通道，安装时"缺哪端补哪端"要用
+/// Each end's executable name paired with its release channel, used by the "fill whichever ends are missing" install step
 fn installed_ends() -> Vec<(String, crate::update::ReleaseChannel)> {
     use crate::update::ReleaseChannel;
     vec![
@@ -136,7 +252,7 @@ fn installed_ends() -> Vec<(String, crate::update::ReleaseChannel)> {
     ]
 }
 
-/// 可执行文件名：Windows 需要 `.exe` 后缀，其余平台就是裸名字
+/// Executable name: Windows needs the `.exe` suffix, other platforms use the bare name
 fn executable_name(base_name: &str) -> String {
     if cfg!(target_os = "windows") {
         format!("{base_name}.exe")
@@ -145,11 +261,11 @@ fn executable_name(base_name: &str) -> String {
     }
 }
 
-/// 执行一次安装：需要时先等旧进程退出，然后把这个源目录里带了的每一端可执行文件与配置拷进前缀。
+/// Run one installation: wait for old processes to exit when needed, then copy every end's executable and the configuration the source directory carries into the prefix.
 ///
-/// 源目录里带哪几端就装哪几端（发布包按端分包：命令行版包只带 `baihua`，图形版包只带 `baihua-gui`，
-/// 终端版包只带 `baihua-tui`）；一端都没有才算失败。这样界面内的 `/update` 只替换自己那一端，
-/// 而首次安装用的命令行版包如果想一次装上三端，由 `install_from_command_line` 再去补齐缺的那两端。
+/// Whatever ends the source directory carries get installed (release packages are split per end: the command line package carries only `baihua`, the graphical package only `baihua-gui`,
+/// the terminal package only `baihua-tui`); only an empty set fails. This way `/update` inside an interface replaces just its own end,
+/// while a first install from the command line package tops up the other two ends through `install_from_command_line`.
 pub fn install(request: &InstallRequest) -> Result<InstallReport, String> {
     if let Some(process_id) = request.wait_for_process {
         wait_for_process_to_exit(process_id);
@@ -168,11 +284,11 @@ pub fn install(request: &InstallRequest) -> Result<InstallReport, String> {
             continue;
         }
         let target_executable = binary_directory.join(&executable_name);
-        // 从安装目录里再跑一次 install 时源与目标可能是同一个文件：这时直接跳过。
-        // 判断必须按"是不是同一个文件"来做，而不是按路径字符串：macOS 上 /tmp 是指向 /private/tmp 的
-        // 符号链接，同一个文件会有两种写法（`current_exe()` 给规范路径，`BAIHUA_DIR` 给用户写的那条路径），
-        // 只字符串比较会让拷贝落到自己头上——`fs::copy` 先截断目标再读源，
-        // 装好的可执行文件会变成空文件（Windows 上则是"文件正被占用"失败）。
+        // Running install from inside the install directory can mean source and target are the same file: skip those copies outright.
+        // The check must ask "is it the same file", never "is it the same path string": on macOS /tmp is a symlink
+        // to /private/tmp, so one file has two spellings (`current_exe()` yields the canonical path, `BAIHUA_DIR` the user's),
+        // and a pure string compare would let the copy land on itself -- `fs::copy` truncates the target before reading the source,
+        // leaving the installed executable empty (on Windows it fails with "file in use" instead).
         if is_same_file(&source_executable, &target_executable) {
             notes.push(format!(
                 "{} already runs from the installation directory; not copied again",
@@ -225,8 +341,8 @@ pub fn install(request: &InstallRequest) -> Result<InstallReport, String> {
     })
 }
 
-/// 两个路径是不是同一个文件。先比字符串，字符串不同再比规范路径（解析符号链接与 `.` / `..`）：
-/// 目标还不存在、父目录不可达等情况下 `canonicalize` 会失败，那时两者本来就不可能是同一个文件。
+/// Whether two paths name the same file. Compare strings first; when they differ compare canonical paths (resolving symlinks and `.` / `..`):
+/// `canonicalize` fails while the target does not exist yet or a parent is unreachable, and then the two cannot be the same file anyway.
 fn is_same_file(first: &Path, second: &Path) -> bool {
     if first == second {
         return true;
@@ -237,19 +353,237 @@ fn is_same_file(first: &Path, second: &Path) -> bool {
     }
 }
 
-/// 命令行版 `install`（对外不带参数）：
-/// - 有"待安装记录"时按记录安装（界面内的 `/update` 拉起的那条路，不提问）；
-/// - 否则把当前可执行文件所在目录里带了的每一端装进默认前缀，缺的那几端若还没装过，
-///   再去各自发布通道取最新包补上，最后问一次要不要写 PATH。
+/// Mount a macOS disk image and replace the installed `Baihua.app` (inside the chosen
+/// Applications directory) with the bundle it carries; its config travels inside it.
+fn install_disk_image(
+    image_path: &Path,
+    prefix: &Path,
+    version: &str,
+) -> Result<InstallReport, String> {
+    let staging_root = paths::update_directory()
+        .ok_or_else(|| "cannot locate the update directory".to_string())?;
+    let mount_point = staging_root.join(format!("mounted-{version}"));
+    std::fs::create_dir_all(&mount_point)
+        .map_err(|error| format!("failed to create {}: {error}", mount_point.display()))?;
+    let attached = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+        .arg(&mount_point)
+        .arg(image_path)
+        .status()
+        .map_err(|error| format!("hdiutil is unavailable: {error}"))
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "mounting the disk image failed, exit status {status}"
+                ))
+            }
+        });
+    let outcome = attached.and_then(|_| {
+        let mounted_bundle = find_directory_named(&mount_point, &application_bundle_name())
+            .ok_or_else(|| {
+                format!(
+                    "the mounted image holds no {}: refusing to install",
+                    application_bundle_name()
+                )
+            })?;
+        replace_application_bundle(&mounted_bundle, &application_install_directory())
+    });
+    let _ = Command::new("hdiutil")
+        .args(["detach", "-force"])
+        .arg(&mount_point)
+        .status();
+    let _ = std::fs::remove_dir_all(&mount_point);
+    let installed_bundle = outcome?;
+    Ok(InstallReport {
+        executable_paths: vec![
+            installed_bundle
+                .join("Contents")
+                .join("MacOS")
+                .join(graphical_executable_name()),
+        ],
+        config_directory: prefix.join("config"),
+        copied_file_count: 1,
+        notes: vec![format!(
+            "graphical application bundle installed at {}",
+            installed_bundle.display()
+        )],
+    })
+}
+
+/// Move a fresh bundle over the installed one inside the given directory: the old bundle
+/// is removed first, so an update never leaves files of the previous version inside it.
+fn replace_application_bundle(
+    source_bundle: &Path,
+    install_directory: &Path,
+) -> Result<PathBuf, String> {
+    let target = install_directory.join(application_bundle_name());
+    if target.exists() {
+        std::fs::remove_dir_all(&target)
+            .map_err(|error| format!("failed to remove {}: {error}", target.display()))?;
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    copy_directory_tree(source_bundle, &target)?;
+    let inner_executable = target
+        .join("Contents")
+        .join("MacOS")
+        .join(graphical_executable_name());
+    if inner_executable.is_file() {
+        mark_executable(&inner_executable)?;
+    }
+    Ok(target)
+}
+
+/// Extract a Windows installer with an administrative install (`/a` unpacks the payload
+/// without touching the registry) and install the directory holding the program file.
+fn install_windows_installer(
+    package_path: &Path,
+    prefix: &Path,
+    version: &str,
+) -> Result<InstallReport, String> {
+    let staged_directory = staging_directory(version)?;
+    std::fs::create_dir_all(&staged_directory)
+        .map_err(|error| format!("failed to create the unpack directory: {error}"))?;
+    let status = Command::new("msiexec")
+        .arg("/a")
+        .arg(package_path)
+        .arg("/qn")
+        .arg(format!("TARGETDIR={}", staged_directory.display()))
+        .status()
+        .map_err(|error| format!("msiexec is unavailable: {error}"))?;
+    // 3010 means "success, reboot requested", which is a completed extraction
+    if !matches!(status.code(), Some(0) | Some(3010)) {
+        return Err(format!(
+            "extracting the installer failed, exit status {status}"
+        ));
+    }
+    let program_file = find_file_by_name(&staged_directory, &graphical_executable_name())
+        .ok_or_else(|| {
+            format!(
+                "the installer holds no {}, refusing to install",
+                graphical_executable_name()
+            )
+        })?;
+    let source_directory = program_file
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .ok_or_else(|| "the extracted program has no directory".to_string())?;
+    install(&InstallRequest {
+        source_directory,
+        prefix: prefix.to_path_buf(),
+        wait_for_process: None,
+    })
+}
+
+/// Install a Linux AppImage: the file is the program, so it is copied under a stable name
+/// and made executable. Its configuration travels inside the image.
+fn install_app_image(package_path: &Path, prefix: &Path) -> Result<InstallReport, String> {
+    let binary_directory = prefix.join("bin");
+    std::fs::create_dir_all(&binary_directory)
+        .map_err(|error| format!("failed to create {}: {error}", binary_directory.display()))?;
+    let target = binary_directory.join(graphical_app_image_name());
+    std::fs::copy(package_path, &target).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            package_path.display(),
+            target.display()
+        )
+    })?;
+    mark_executable(&target)?;
+    Ok(InstallReport {
+        executable_paths: vec![target],
+        config_directory: prefix.join("config"),
+        copied_file_count: 1,
+        notes: Vec::new(),
+    })
+}
+
+/// Copy a whole directory tree (an application bundle) to a fresh destination.
+fn copy_directory_tree(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target)
+        .map_err(|error| format!("failed to create {}: {error}", target.display()))?;
+    let entries = std::fs::read_dir(source)
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("failed to list {}: {error}", source.display()))?;
+        let child_source = entry.path();
+        let child_target = target.join(entry.file_name());
+        if child_source.is_dir() {
+            copy_directory_tree(&child_source, &child_target)?;
+        } else {
+            std::fs::copy(&child_source, &child_target).map_err(|error| {
+                format!(
+                    "failed to copy {} to {}: {error}",
+                    child_source.display(),
+                    child_target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The first directory with this exact name anywhere below a root, searched recursively.
+fn find_directory_named(root: &Path, directory_name: &str) -> Option<PathBuf> {
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(directory) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .map(|name| name == directory_name)
+                .unwrap_or(false)
+            {
+                return Some(path);
+            }
+            queue.push(path);
+        }
+    }
+    None
+}
+
+/// The first file with this exact name anywhere below a root, searched recursively.
+fn find_file_by_name(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(directory) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push(path);
+            } else if path
+                .file_name()
+                .map(|name| name == file_name)
+                .unwrap_or(false)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+/// The command line end's `install` (no arguments in public use):
+/// - when a "pending install" record exists, install exactly what it says (the route an in-interface `/update` starts; no questions asked);
+/// - otherwise install every end sitting next to the current executable into the default prefix, and for ends never installed before
+///   fetch the latest package from their release channels, then ask once about writing PATH.
 pub fn install_from_command_line() -> Result<InstallReport, String> {
     let fallback_prefix =
         default_prefix().ok_or_else(|| "cannot determine the installation prefix".to_string())?;
     if let Some(pending) = read_pending_install() {
-        let report = install(&InstallRequest {
-            source_directory: PathBuf::from(&pending.staged_directory),
-            prefix: PathBuf::from(&pending.prefix),
-            wait_for_process: pending.wait_for_process,
-        });
+        let report = install_downloaded_package(&pending);
         // The record is only invalidated after a successful install; on failure it stays so the user can re-run install and still succeed
         if report.is_ok()
             && let Some(path) = pending_install_path()
@@ -259,7 +593,7 @@ pub fn install_from_command_line() -> Result<InstallReport, String> {
         let mut report = report?;
         report.notes.push(format!(
             "this install came from the update package {} (prefix {})",
-            pending.staged_directory, pending.prefix
+            pending.package_path, pending.prefix
         ));
         return Ok(report);
     }
@@ -272,14 +606,14 @@ pub fn install_from_command_line() -> Result<InstallReport, String> {
         prefix: prefix.clone(),
         wait_for_process: None,
     })?;
-    // 发布包按端分包，命令行版包里只有 `baihua`：另外两端如果本地没有、前缀里也没有，
-    // 就从它们各自的发布通道取最新包补上，做到"一次安装同时装上三端"。
+    // Release packages are split per end and the command line package holds only `baihua`: if either other end is present neither locally nor in the prefix,
+    // its latest package comes from its release channel, so one install can put all three ends in place.
     report
         .notes
         .extend(install_missing_ends(&source_directory, &prefix));
     let binary_directory = prefix.join("bin");
     if !interactive() {
-        // 没人能回答问题的场合擅自改 shell 配置是不合适的：只报告该加哪一行
+        // Changing shell configuration without anyone there to answer a prompt would be wrong: report the line to add instead
         report.notes.push(format!(
             "(non-interactive run, PATH untouched) add it yourself when needed: export PATH=\"{}:$PATH\"",
             binary_directory.display()
@@ -299,15 +633,20 @@ pub fn install_from_command_line() -> Result<InstallReport, String> {
     Ok(report)
 }
 
-/// 源目录里没带、安装前缀里也还没有的那几端：从各自发布通道下载最新安装包补上。
-/// 每一端的失败都只换成一句说明，不中断其它端与配置的安装。
+/// For ends neither the source directory carries nor the prefix has yet: download the latest package from each release channel.
+/// A failure on one end becomes a single note and never interrupts the other ends or the configuration install.
 fn install_missing_ends(source_directory: &Path, prefix: &Path) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     for (executable_name, channel) in installed_ends() {
         if source_directory.join(&executable_name).is_file() {
             continue;
         }
-        if prefix.join("bin").join(&executable_name).is_file() {
+        let already_installed = if executable_name == graphical_executable_name() {
+            graphical_application_path().is_some()
+        } else {
+            installed_payload(prefix, &executable_name).is_some()
+        };
+        if already_installed {
             notes.push(format!(
                 "{executable_name} is already installed; left untouched (use `baihua update` to upgrade it)"
             ));
@@ -318,33 +657,24 @@ fn install_missing_ends(source_directory: &Path, prefix: &Path) -> Vec<String> {
     notes
 }
 
-/// 取某一条通道上最新的安装包，下载、校验、解包后装进前缀。
+/// Take the newest package on one channel, download, verify, unpack, and install it into the prefix.
 fn install_latest_release_of(
     channel: crate::update::ReleaseChannel,
     prefix: &Path,
     executable_name: &str,
 ) -> String {
     use crate::update::{UpdateCheck, check_for_update, download_package};
-    let Some(staging_root) = paths::update_directory() else {
-        return format!(
-            "{executable_name} was not installed: cannot locate the update directory; run `baihua install` again later"
-        );
-    };
-    // 当前版本传 "0"：这一端还没装过，发布页上最新那个包就是要装的那个
+    // Pass "0" as the current version: this end was never installed, so the newest package wins
     match check_for_update("0", channel) {
         UpdateCheck::Available(package) => match download_package(&package) {
-            Ok(archive_path) => {
-                let staged_directory =
-                    staging_root.join(format!("staged-{executable_name}-{}", package.version));
-                let install_result =
-                    extract_archive(&archive_path, &staged_directory).and_then(|directory| {
-                        install(&InstallRequest {
-                            source_directory: directory,
-                            prefix: prefix.to_path_buf(),
-                            wait_for_process: None,
-                        })
-                        .map(|_| ())
-                    });
+            Ok(package_file) => {
+                let install_result = install_downloaded_package(&PendingInstall {
+                    package_path: package_file.to_string_lossy().to_string(),
+                    version: package.version.clone(),
+                    prefix: prefix.to_string_lossy().to_string(),
+                    wait_for_process: None,
+                })
+                .map(|_| ());
                 match install_result {
                     Ok(()) => format!(
                         "{executable_name} {} installed from the {} release",
@@ -358,7 +688,7 @@ fn install_latest_release_of(
         },
         UpdateCheck::UpToDate { newest_tag, .. } => {
             if newest_tag.is_empty() {
-                // 这条通道还从来没有发布过（例如刚拆分的命令行版/图形版）
+                // This channel has never published anything (for example the freshly split command line / graphical ends)
                 format!(
                     "{executable_name} was not installed: the {} release channel has no published release yet",
                     channel.display_name()
@@ -375,12 +705,26 @@ fn install_latest_release_of(
     }
 }
 
-/// 命令行版 `uninstall`：删掉装好的三端可执行文件，并问一次要不要连同配置与缓存一起删。
+/// The command line end's `uninstall`: remove the three installed executables and ask once whether configuration and caches go too.
 pub fn uninstall_from_command_line() -> Result<Vec<String>, String> {
     let prefix =
         default_prefix().ok_or_else(|| "cannot determine the installation prefix".to_string())?;
     let binary_directory = prefix.join("bin");
     let mut notes: Vec<String> = Vec::new();
+    for bundle_directory in application_bundle_directories() {
+        let bundle = bundle_directory.join(application_bundle_name());
+        if bundle.is_dir() {
+            std::fs::remove_dir_all(&bundle)
+                .map_err(|error| format!("failed to remove {}: {error}", bundle.display()))?;
+            notes.push(format!("removed {}", bundle.display()));
+        }
+    }
+    let legacy_bundle = prefix.join(application_bundle_name());
+    if legacy_bundle.is_dir() {
+        std::fs::remove_dir_all(&legacy_bundle)
+            .map_err(|error| format!("failed to remove {}: {error}", legacy_bundle.display()))?;
+        notes.push(format!("removed {}", legacy_bundle.display()));
+    }
     for executable_name in installed_executable_names() {
         let executable_path = binary_directory.join(&executable_name);
         if executable_path.is_file() {
@@ -395,11 +739,11 @@ pub fn uninstall_from_command_line() -> Result<Vec<String>, String> {
             ));
         }
     }
-    // 只清理我们自己写进去的那几行，别碰用户自己的 PATH 配置
+    // Clean up only the lines this installer wrote and leave the user's own PATH configuration alone
     if let Some(removed) = remove_directory_from_path(&binary_directory) {
         notes.push(removed);
     }
-    // 一次询问覆盖所有"装出来的与攒出来的"文件：配置目录与可再生缓存（消息、头像）
+    // One question covers everything installed or accumulated: the configuration directory and the regenerable caches (messages, avatars)
     let mut removable: Vec<PathBuf> = Vec::new();
     let config_directory = prefix.join("config");
     if config_directory.is_dir() {
@@ -576,7 +920,7 @@ fn remove_directory_from_path(_directory: &Path) -> Option<String> {
 }
 
 /// On uninstall, remove the paragraph we wrote (on Windows, remove the one item in the user's PATH).
-/// 返回 None 表示根本没写过，不去动用户的文件。
+/// A None return means nothing was ever written, so the user's file stays untouched.
 #[cfg(windows)]
 fn remove_directory_from_path(directory: &Path) -> Option<String> {
     let display = directory.display().to_string();
@@ -592,7 +936,7 @@ fn remove_directory_from_path(directory: &Path) -> Option<String> {
 }
 
 /// Is anyone available to answer questions: there is no one in detached process, piped input, or redirected output scenarios.
-/// When there is no one, never擅自 modify the user's shell config, and never block on read input.
+/// When nobody is there to answer, never modify the user's shell configuration on our own and never block on reading input.
 fn interactive() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -705,7 +1049,7 @@ fn read_pending_install() -> Option<PendingInstall> {
             return None;
         }
     };
-    if PathBuf::from(&parsed.staged_directory).is_dir() {
+    if PathBuf::from(&parsed.package_path).is_file() {
         Some(parsed)
     } else {
         let _ = std::fs::remove_file(&path);
@@ -721,20 +1065,16 @@ fn install_log_path() -> Option<PathBuf> {
 
 /// Start the installer process detached from the terminal: the pending content is first written to the pending install record,
 /// then launch `baihua-client install` (without any parameters) to let it wait for the old process to exit before committing.
-pub fn spawn_detached_installer(request: &InstallRequest) -> Result<(), String> {
-    // 真正执行安装的是命令行版 `baihua`：图形版与终端版自己不处理命令行参数，
-    // 只能把"待安装记录"写下来，再拉起同目录（或 PATH 上）的命令行版来做替换。
+pub fn spawn_detached_installer(pending: &PendingInstall) -> Result<(), String> {
+    // The command line end `baihua` performs every real install: the graphical and terminal ends do not parse installer arguments themselves,
+    // so they write the "pending install" record and launch the sibling (or PATH-resolved) `baihua` to carry out the swap.
     let command_line_executable = locate_command_line_executable().ok_or_else(|| {
         format!(
             "cannot locate the command line executable `{}`; the installer was not started",
             command_line_executable_name()
         )
     })?;
-    write_pending_install(&PendingInstall {
-        staged_directory: request.source_directory.to_string_lossy().to_string(),
-        prefix: request.prefix.to_string_lossy().to_string(),
-        wait_for_process: request.wait_for_process,
-    })?;
+    write_pending_install(pending)?;
     let mut command = Command::new(&command_line_executable);
     command.arg("install");
     // The detached process has no terminal to write to; results only go into the install log
@@ -754,8 +1094,8 @@ pub fn spawn_detached_installer(request: &InstallRequest) -> Result<(), String> 
     Ok(())
 }
 
-/// 命令行版可执行文件的位置：安装之后三端同在 `<前缀>/bin`，所以先看当前进程所在目录，
-/// 再退回默认前缀的 `bin/`，最后看 PATH。界面内的 `/update` 与命令行版自己的更新都走它。
+/// Where the command line executable lives: after installation all three ends share `<prefix>/bin`, so check the current process's directory first,
+/// then the default prefix's `bin/`, and finally PATH. Both the in-interface `/update` and the command line end's own updates use it.
 fn locate_command_line_executable() -> Option<PathBuf> {
     let file_name = command_line_executable_name();
     if let Some(current_executable) = paths::current_executable()
@@ -859,13 +1199,13 @@ fn copy_missing_files_recursively(source: &Path, target: &Path) -> Result<usize,
     Ok(copied)
 }
 
-/// 把随程序发布的语言文件里"用户那份还没有的条目"补进用户那份，返回补过的文件数。
+/// Fill entries from the shipped language files that the user's copy lacks, returning how many files were patched.
 ///
-/// 语言文件是程序自带的文案表：旧版本安装出去的那一份会一直留在用户配置目录里
-/// （`copy_missing_files_recursively` 只补不存在的文件），新版本加进来的键在那一份里根本没有，
-/// 界面上就会把键名当文案显示出来。这里做的只是**补缺**：
-/// 用户自己改过的条目、自己加的语言文件都不动，
-/// preferences.json（用户的设置与登录会话）更是照旧碰都不碰。
+/// Language files are the program's own text tables: a copy installed by an older version stays in the user configuration directory forever
+/// (`copy_missing_files_recursively` only adds missing files), so keys introduced by newer versions simply are not in it and
+/// the interface would show raw key names. This step only ever **fills gaps**:
+/// entries the user edited and language files the user added stay untouched,
+/// and preferences.json (the user's settings and login session) is never touched at all.
 fn merge_missing_language_entries(
     source_config: &Path,
     target_config: &Path,
@@ -885,7 +1225,7 @@ fn merge_missing_language_entries(
             continue;
         }
         let target_path = target_config.join("languages").join(entry.file_name());
-        // 目标里没有这份语言文件：那是"补齐缺失文件"那份逻辑的活，这里只处理"两份都有"的情况
+        // The target lacks this language file entirely: that is the copy-missing-files logic's job; here only "both copies exist" is handled
         if !target_path.is_file() {
             continue;
         }
@@ -934,16 +1274,19 @@ mod tests {
     fn staging_area(label: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!("baihua-installer-{label}"));
         let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(directory.join("payload/config/themes")).expect("源目录应可创建");
-        std::fs::create_dir_all(directory.join("target")).expect("目标目录应可创建");
-        std::fs::write(directory.join("payload/baihua"), b"fake-binary").expect("写入源文件应成功");
+        std::fs::create_dir_all(directory.join("payload/config/themes"))
+            .expect("the source directory must be creatable");
+        std::fs::create_dir_all(directory.join("target"))
+            .expect("the target directory must be creatable");
+        std::fs::write(directory.join("payload/baihua"), b"fake-binary")
+            .expect("writing the source file must succeed");
         std::fs::write(directory.join("payload/config/themes/dark.json"), b"{}")
-            .expect("写入主题应成功");
+            .expect("writing the theme must succeed");
         std::fs::write(
             directory.join("payload/config/preferences.json"),
             b"{\"show_uid\":true}",
         )
-        .expect("写入偏好应成功");
+        .expect("writing the preferences must succeed");
         directory
     }
 
@@ -956,11 +1299,11 @@ mod tests {
             prefix: staging.join("target"),
             wait_for_process: None,
         })
-        .expect("安装应成功");
+        .expect("installation must succeed");
         assert_eq!(
             report.executable_paths.len(),
             1,
-            "源目录里只有一个可执行文件时，只装这一端"
+            "with a single executable in the source directory only that end installs"
         );
         assert!(report.executable_paths[0].is_file());
         assert!(report.config_directory.join("themes/dark.json").is_file());
@@ -972,13 +1315,13 @@ mod tests {
                 .mode()
                 & 0o111
                 != 0,
-            "安装后的可执行文件应带执行位"
+            "the installed executable must carry the executable bit"
         );
         let _ = std::fs::remove_dir_all(&staging);
     }
 
-    /// 一次安装要把源目录里带了的每一端都装进 `<前缀>/bin`：发布包按端分包，
-    /// 而源码树里三端产物同目录，这条测试盯的就是"三端同目录时一次装齐"。
+    /// One installation must put every end the source directory carries into `<prefix>/bin`: release packages are split per end,
+    /// while the source tree keeps all three products in one directory, and this test guards "one pass installs all three".
     #[cfg(unix)]
     #[test]
     fn install_copies_every_end_found_in_the_source_directory() {
@@ -988,18 +1331,18 @@ mod tests {
                 staging.join("payload").join(&executable_name),
                 b"fake-binary",
             )
-            .expect("写入三端产物应成功");
+            .expect("writing the three end products must succeed");
         }
         let report = install(&InstallRequest {
             source_directory: staging.join("payload"),
             prefix: staging.join("target"),
             wait_for_process: None,
         })
-        .expect("安装应成功");
+        .expect("installation must succeed");
         assert_eq!(
             report.executable_paths.len(),
             3,
-            "源目录里的三端都要装上，实际: {:?}",
+            "all three ends in the source directory must install, got: {:?}",
             report.executable_paths
         );
         for executable_name in installed_executable_names() {
@@ -1008,71 +1351,73 @@ mod tests {
                     .file_name()
                     .map(|name| name == executable_name.as_str())
                     == Some(true)),
-                "{executable_name} 应该装进 bin 目录"
+                "{executable_name} must be installed into the bin directory"
             );
         }
         let _ = std::fs::remove_dir_all(&staging);
     }
 
-    /// 从安装目录里再跑一次 `install`（源与目标其实是同一个文件）必须只记一条说明、不拷贝。
+    /// Running `install` from inside the install directory (source and target are one file) must leave only a note and copy nothing.
     ///
-    /// 这条测试盯的是"只比路径字符串"那种写法：macOS 上 `/tmp` 指向 `/private/tmp`，
-    /// 同一个文件有两种写法，字符串比较会判成"两个文件"，接着 `fs::copy` 先截断目标再读源，
-    /// 装好的可执行文件就变成了 0 字节的空文件（本次验证安装程序时就是这样把三端全清空的）。
+    /// This test guards the "compare path strings only" mistake: on macOS `/tmp` points at `/private/tmp`,
+    /// so one file has two spellings, a string compare calls them two files, `fs::copy` truncates the target before reading the source,
+    /// and the installed executables collapse to zero bytes (this is exactly how the installer once wiped all three ends during verification).
     #[cfg(unix)]
     #[test]
     fn install_skips_copying_the_executable_onto_itself_through_a_symlink_alias() {
         let staging = staging_area("self-copy");
-        // real/bin 里放好三端产物，alias 是指向 real 的符号链接：
-        // 源目录走 alias 这一条路径，安装前缀走 real 这一条路径，两者其实是同一个目录
+        // real/bin holds the three end products and alias is a symlink to real:
+        // the source directory is reached through alias and the install prefix through real, yet both name the same directory
         let real_root = staging.join("real");
-        std::fs::create_dir_all(real_root.join("bin")).expect("真实安装目录应可创建");
+        std::fs::create_dir_all(real_root.join("bin"))
+            .expect("the real install directory must be creatable");
         for executable_name in installed_executable_names() {
             std::fs::write(real_root.join("bin").join(&executable_name), b"fake-binary")
-                .expect("写入三端产物应成功");
+                .expect("writing the three end products must succeed");
         }
         let alias_root = staging.join("alias");
-        std::os::unix::fs::symlink(&real_root, &alias_root).expect("符号链接应可创建");
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("the symlink must be creatable");
 
         let report = install(&InstallRequest {
             source_directory: alias_root.join("bin"),
             prefix: real_root.clone(),
             wait_for_process: None,
         })
-        .expect("同一个文件的安装应成功");
+        .expect("installing the same file onto itself must succeed");
         assert_eq!(
             report.notes.len(),
             installed_executable_names().len(),
-            "每一端都该带一条“已经在安装目录里运行”的说明，实际 {:?}",
+            "every end should carry an \"already running from the install directory\" note, got {:?}",
             report.notes
         );
         for executable_name in installed_executable_names() {
             let installed = real_root.join("bin").join(&executable_name);
             assert_eq!(
-                std::fs::read(&installed).expect("装好的可执行文件应能读回"),
+                std::fs::read(&installed).expect("the installed executable must read back"),
                 b"fake-binary",
-                "{executable_name} 被拷到了自己头上（先截断再读会得到空文件）"
+                "{executable_name} was copied onto itself (truncating before reading yields an empty file)"
             );
         }
         let _ = std::fs::remove_dir_all(&staging);
     }
 
-    /// 源目录里一端可执行文件都没有时必须报错：否则用户会以为装好了，实际 bin 目录是空的。
+    /// A source directory without a single executable must fail loudly: otherwise the user believes the install worked on an empty bin directory.
     #[test]
     fn install_reports_when_the_source_directory_has_no_executable() {
         let staging = staging_area("no-executable");
-        // staging_area 会预置 `payload/baihua`，这里换成只放配置的空目录
+        // staging_area pre-creates `payload/baihua`, so swap in an empty directory holding only configuration
         let empty_source = staging.join("payload-without-executable");
-        std::fs::create_dir_all(empty_source.join("config")).expect("空源目录应可创建");
+        std::fs::create_dir_all(empty_source.join("config"))
+            .expect("the empty source directory must be creatable");
         let error = install(&InstallRequest {
             source_directory: empty_source,
             prefix: staging.join("target"),
             wait_for_process: None,
         })
-        .expect_err("没有可执行文件时不应报告成功");
+        .expect_err("without any executable the installer must not report success");
         assert!(
             error.contains("no installable executable"),
-            "实际错误: {error}"
+            "the actual error: {error}"
         );
         let _ = std::fs::remove_dir_all(&staging);
     }
@@ -1082,70 +1427,73 @@ mod tests {
     fn install_keeps_existing_user_preferences() {
         let staging = staging_area("keep-preferences");
         let target_config = staging.join("target/config");
-        std::fs::create_dir_all(&target_config).expect("目标配置目录应可创建");
+        std::fs::create_dir_all(&target_config)
+            .expect("the target configuration directory must be creatable");
         std::fs::write(
             target_config.join("preferences.json"),
             b"{\"show_uid\":false}",
         )
-        .expect("预置用户偏好应成功");
+        .expect("seeding the user preferences must succeed");
         install(&InstallRequest {
             source_directory: staging.join("payload"),
             prefix: staging.join("target"),
             wait_for_process: None,
         })
-        .expect("安装应成功");
+        .expect("installation must succeed");
         assert_eq!(
             std::fs::read_to_string(target_config.join("preferences.json")).unwrap(),
             "{\"show_uid\":false}",
-            "已存在的用户偏好不能被安装程序覆盖"
+            "the installer must not overwrite existing user preferences"
         );
         let _ = std::fs::remove_dir_all(&staging);
     }
 
-    /// 本轮修复"大量文本无法读取语言文件，显示占位符"的安装侧一半：
-    /// 用户配置目录里那份语言文件是旧版本留下的，缺新版本的条目；
-    /// 安装（更新走的也是这条路）要把新条目补进去，同时不能动用户自己改过的条目。
+    /// The installer half of the "most texts fell back to placeholder keys" fix:
+    /// the language file in the user directory came from an older version and misses the new entries;
+    /// installing (updates take this road too) must fill the new entries while leaving the user's own edits alone.
     #[test]
     fn install_adds_the_language_entries_the_user_copy_is_missing() {
         let staging = staging_area("merge-language");
         let source_languages = staging.join("payload/config/languages");
         let target_languages = staging.join("target/config/languages");
-        std::fs::create_dir_all(&source_languages).expect("源语言目录应可创建");
-        std::fs::create_dir_all(&target_languages).expect("目标语言目录应可创建");
+        std::fs::create_dir_all(&source_languages)
+            .expect("the source languages directory must be creatable");
+        std::fs::create_dir_all(&target_languages)
+            .expect("the target languages directory must be creatable");
         std::fs::write(
             source_languages.join("zh-CN.json"),
-            "{\"page_login\":\"登录\",\"message_input_placeholder\":\"输入消息\"}",
+            "{\"page_login\":\"log in\",\"message_input_placeholder\":\"type a message\"}",
         )
-        .expect("写入随程序发布的语言文件应成功");
+        .expect("writing the shipped language file must succeed");
         std::fs::write(
             target_languages.join("zh-CN.json"),
-            "{\"page_login\":\"我改过的登录\"}",
+            "{\"page_login\":\"my edited login\"}",
         )
-        .expect("写入用户那份语言文件应成功");
+        .expect("writing the user's language file must succeed");
 
         install(&InstallRequest {
             source_directory: staging.join("payload"),
             prefix: staging.join("target"),
             wait_for_process: None,
         })
-        .expect("安装应成功");
+        .expect("installation must succeed");
 
         let merged: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(target_languages.join("zh-CN.json"))
-                .expect("应能读回合并结果"),
+                .expect("the merged result must read back"),
         )
-        .expect("合并结果应是合法 JSON");
+        .expect("the merged result must be valid JSON");
         assert_eq!(
             merged.get("page_login").and_then(serde_json::Value::as_str),
-            Some("我改过的登录"),
-            "用户改过的条目不能被安装程序覆盖"
+            Some("my edited login"),
+            "the installer must not overwrite entries the user edited"
         );
         assert_eq!(
             merged
                 .get("message_input_placeholder")
                 .and_then(serde_json::Value::as_str),
-            Some("输入消息"),
-            "新版本多出来的条目要补进用户那份，否则界面上显示成键名占位符"
+            Some("type a message"),
+            "entries new in this version must be filled into the user's copy, or the interface shows key placeholders"
         );
         let _ = std::fs::remove_dir_all(&staging);
     }
@@ -1156,36 +1504,40 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("baihua-path-block-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("临时目录应可创建");
+        std::fs::create_dir_all(&directory).expect("the temporary directory must be creatable");
         let profile = directory.join("zshrc");
-        // 用户自己已有的配置必须原样保留
-        std::fs::write(&profile, "export EDITOR=vim\n").expect("预置用户配置应成功");
+        // Whatever the user already had in the file must survive untouched
+        std::fs::write(&profile, "export EDITOR=vim\n")
+            .expect("seeding the user configuration must succeed");
 
         assert!(
-            append_path_block(&profile, &directory).expect("首次写入应成功"),
-            "第一次安装应写入 PATH 段落"
+            append_path_block(&profile, &directory).expect("the first write must succeed"),
+            "a first install must write the PATH block"
         );
         assert!(
-            !append_path_block(&profile, &directory).expect("重复写入不应失败"),
-            "重复安装不该再叠一段"
+            !append_path_block(&profile, &directory).expect("a repeated write must not fail"),
+            "reinstalling must not stack a second block"
         );
-        let written = std::fs::read_to_string(&profile).expect("应能读回启动文件");
+        let written = std::fs::read_to_string(&profile).expect("the startup file must read back");
         assert_eq!(
             written.matches("export PATH=").count(),
             1,
-            "实际内容: {written}"
+            "actual content: {written}"
         );
         assert!(
             written.contains("export EDITOR=vim"),
-            "用户自己的行不该被动过"
+            "the user's own lines must not be altered"
         );
 
-        assert!(remove_path_block(&profile).expect("撤除应成功"));
-        let after = std::fs::read_to_string(&profile).expect("应能读回启动文件");
-        assert_eq!(after, "export EDITOR=vim\n", "撤除后应只剩用户自己的内容");
+        assert!(remove_path_block(&profile).expect("removal must succeed"));
+        let after = std::fs::read_to_string(&profile).expect("the startup file must read back");
+        assert_eq!(
+            after, "export EDITOR=vim\n",
+            "after removal only the user's own content should remain"
+        );
         assert!(
-            !remove_path_block(&profile).expect("没有段落时不该报错"),
-            "没写过就不该说撤除了什么"
+            !remove_path_block(&profile).expect("an absent block must not raise an error"),
+            "when nothing was written there is nothing to report as removed"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1213,5 +1565,167 @@ mod tests {
             "actual error: {error}"
         );
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    /// The graphical end may be a bundle, an AppImage or a bare executable, and the
+    /// discovery order must prefer the bundle, then the AppImage, then the executable.
+    #[test]
+    fn graphical_payload_prefers_the_bundle_then_the_app_image() {
+        let area = staging_area("graphical-payload");
+        let prefix = area.join("target");
+        assert_eq!(
+            installed_payload(&prefix, &graphical_executable_name()),
+            None,
+            "an empty prefix has no graphical end at all"
+        );
+        std::fs::create_dir_all(prefix.join("bin"))
+            .expect("the binary directory must be creatable");
+        std::fs::write(prefix.join("bin").join(graphical_executable_name()), b"exe")
+            .expect("the bare executable must be writable");
+        assert_eq!(
+            installed_payload(&prefix, &graphical_executable_name()),
+            Some(prefix.join("bin").join(graphical_executable_name())),
+            "with only the bare executable installed, that is the payload"
+        );
+        std::fs::write(prefix.join("bin").join(graphical_app_image_name()), b"app")
+            .expect("the AppImage must be writable");
+        assert_eq!(
+            installed_payload(&prefix, &graphical_executable_name()),
+            Some(prefix.join("bin").join(graphical_app_image_name())),
+            "an AppImage outranks the bare executable"
+        );
+        std::fs::create_dir_all(prefix.join(application_bundle_name()))
+            .expect("the bundle directory must be creatable");
+        assert_eq!(
+            installed_payload(&prefix, &graphical_executable_name()),
+            Some(prefix.join(application_bundle_name())),
+            "the application bundle outranks everything else"
+        );
+        assert_eq!(
+            installed_payload(&prefix, &terminal_executable_name()),
+            None,
+            "the other ends never resolve to a graphical payload"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    /// An AppImage package is the program: installing it copies one file into the prefix
+    /// and marks it executable, and the payload discovery finds it right afterwards.
+    #[test]
+    fn app_image_package_installs_as_one_executable_file() {
+        let area = staging_area("app-image");
+        let package_path = area.join("baihua-gui-9.9.9-x86_64-unknown-linux-gnu.AppImage");
+        std::fs::write(&package_path, b"fake-app-image")
+            .expect("the package file must be writable");
+        let prefix = area.join("target");
+        let report = install_app_image(&package_path, &prefix).expect("the install must succeed");
+        assert_eq!(report.copied_file_count, 1);
+        assert_eq!(
+            report.executable_paths,
+            vec![prefix.join("bin").join(graphical_app_image_name())]
+        );
+        assert_eq!(
+            std::fs::read(prefix.join("bin").join(graphical_app_image_name()))
+                .expect("the installed file must exist"),
+            b"fake-app-image"
+        );
+        assert!(
+            installed_payload(&prefix, &graphical_executable_name()).is_some(),
+            "the freshly installed AppImage must be discoverable as the graphical end"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    /// Every place the graphical end may live is reported in priority order, so the
+    /// command line can point a user at the app bundle instead of guessing.
+    #[test]
+    fn graphical_payloads_are_listed_in_priority_order() {
+        let prefix = PathBuf::from("/tmp/prefix");
+        assert_eq!(
+            graphical_payloads(&prefix),
+            vec![
+                prefix.join("Baihua.app"),
+                prefix.join("bin").join("Baihua.AppImage"),
+                prefix.join("bin").join(graphical_executable_name()),
+            ]
+        );
+    }
+
+    /// The disk-image and installer payloads are found by name at any depth, because
+    /// the mount point and the administrative-extract tree both wrap extra directories.
+    #[test]
+    fn payloads_are_found_at_any_depth_below_the_root() {
+        let area = staging_area("find-payloads");
+        let nested = area.join("payload/Media/Applications/Baihua.app/Contents/MacOS");
+        std::fs::create_dir_all(&nested).expect("the nested tree must be creatable");
+        std::fs::write(nested.join(graphical_executable_name()), b"exe")
+            .expect("the inner executable must be writable");
+        assert_eq!(
+            find_directory_named(&area.join("payload"), &application_bundle_name()),
+            Some(
+                area.join("payload/Media/Applications")
+                    .join(application_bundle_name())
+            ),
+            "the bundle must be found through the mount layout"
+        );
+        assert_eq!(
+            find_file_by_name(&area.join("payload"), &graphical_executable_name()),
+            Some(nested.join(graphical_executable_name())),
+            "the program file must be found through the installer layout"
+        );
+        assert_eq!(
+            find_directory_named(&area.join("payload"), "NoSuchThing.app"),
+            None,
+            "a name that is not there must not be invented"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    /// The bundle lands in the first candidate directory that accepts writes; a path
+    /// blocked by a regular file must be skipped, never chosen.
+    #[test]
+    fn bundle_installs_into_the_first_writable_directory() {
+        let area = staging_area("application-install");
+        let blocked = area.join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("the blocker must be writable");
+        let writable = area.join("writable");
+        let candidates: Vec<PathBuf> = vec![blocked.clone(), writable.clone()];
+        assert_eq!(
+            application_install_directory_from(&candidates),
+            writable,
+            "the blocked candidate must be passed over"
+        );
+        let blocked_only: Vec<PathBuf> = vec![blocked.clone()];
+        assert_eq!(
+            application_install_directory_from(&blocked_only),
+            blocked,
+            "when nothing accepts writes the last candidate still reports its own failure"
+        );
+        let _ = std::fs::remove_dir_all(&area);
+    }
+
+    /// On macOS the search starts at /Applications and always ends with the prefix
+    /// payloads, so a dragged-in bundle outranks a historic prefix installation.
+    #[test]
+    fn graphical_candidates_start_with_applications_on_macos() {
+        let candidates = graphical_application_candidates();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                candidates
+                    .first()
+                    .map(|path| path.to_string_lossy().to_string()),
+                Some("/Applications/Baihua.app".to_string()),
+                "the system Applications directory must come first"
+            );
+            let prefix = default_prefix().expect("the tests run with HOME set");
+            assert_eq!(
+                candidates.last(),
+                Some(&prefix.join("bin").join(graphical_executable_name())),
+                "the prefix payloads must close the search order"
+            );
+        } else {
+            let prefix = default_prefix().expect("the tests run with HOME set");
+            assert_eq!(candidates, graphical_payloads(&prefix));
+        }
     }
 }

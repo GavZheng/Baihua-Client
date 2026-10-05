@@ -1,6 +1,6 @@
 [package]
 name = "baihua-core"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 
 [lib]
@@ -23,3 +23,13 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 base64 = "0.23"
 chacha20poly1305 = "0.11"
 thiserror = "2"
+
+# Android-only: HTTPS trust anchors compiled into the binary. reqwest's default
+# TLS stack validates through `rustls-platform-verifier`, whose Android back end
+# lives in a Java helper library that cargo-apk does not package into the APK --
+# on Android every https request (a URL avatar on any https host) failed with a
+# verifier error while plain http worked. With `tls_certs_only` reqwest verifies
+# against exactly the roots we hand it, so the built-in Mozilla set (same roots
+# web browsers ship) replaces the unreachable system store on that platform.
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1"

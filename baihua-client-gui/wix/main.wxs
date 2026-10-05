@@ -1,0 +1,156 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!-- Custom cargo-wix installer source: $(var.Version), $(var.Platform) and -->
+<!-- $(var.CargoTargetBinDir) are filled by cargo-wix; paths sit at the repo root. -->
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='Baihua'
+        UpgradeCode='1C5BA9E2-3505-4E2C-ADDA-EB38B7F69C15'
+        Manufacturer='ChepleBob'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Baihua instant messenger, graphical client'
+            Manufacturer='ChepleBob'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'/>
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='Baihua Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='Baihua'>
+
+                    <Component Id='License' Guid='*'>
+                        <File Id='LicenseFile' Name='LICENSE' DiskId='1' Source='LICENSE' KeyPath='yes'/>
+                    </Component>
+
+                    <!-- bin plus the sibling config tree: the layout that core's
+                          configuration lookup walks upward from the exe to find. -->
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='8198B550-735A-4B51-B939-A8E5A6573621' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='baihua-gui.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\baihua-gui.exe'
+                                KeyPath='yes'>
+                                <Shortcut Id='StartMenuShortcut'
+                                    Name='Baihua'
+                                    Description='Baihua instant messenger'
+                                    Directory='ProgramMenuFolder'
+                                    Advertise='no'
+                                    Icon='ProductICO'/>
+                                <Shortcut Id='DesktopShortcut'
+                                    Name='Baihua'
+                                    Description='Baihua instant messenger'
+                                    Directory='DesktopFolder'
+                                    Advertise='no'
+                                    Icon='ProductICO'/>
+                            </File>
+                        </Component>
+                    </Directory>
+
+                    <Directory Id='ConfigFolder' Name='config'>
+                        <Directory Id='LanguagesFolder' Name='languages'>
+                            <Component Id='LanguageEnglish' Guid='*'>
+                                <File Id='LanguageEnglishFile' Name='en-US.json' DiskId='1' Source='config\languages\en-US.json' KeyPath='yes'/>
+                            </Component>
+                            <Component Id='LanguageChinese' Guid='*'>
+                                <File Id='LanguageChineseFile' Name='zh-CN.json' DiskId='1' Source='config\languages\zh-CN.json' KeyPath='yes'/>
+                            </Component>
+                        </Directory>
+                        <Directory Id='ThemesFolder' Name='themes'>
+                            <Component Id='ThemeDefault' Guid='*'>
+                                <File Id='ThemeDefaultFile' Name='default.json' DiskId='1' Source='config\themes\default.json' KeyPath='yes'/>
+                            </Component>
+                            <Component Id='ThemeDark' Guid='*'>
+                                <File Id='ThemeDarkFile' Name='dark.json' DiskId='1' Source='config\themes\dark.json' KeyPath='yes'/>
+                            </Component>
+                            <Component Id='ThemeLight' Guid='*'>
+                                <File Id='ThemeLightFile' Name='light.json' DiskId='1' Source='config\themes\light.json' KeyPath='yes'/>
+                            </Component>
+                            <Component Id='ThemeHighContrast' Guid='*'>
+                                <File Id='ThemeHighContrastFile' Name='high-contrast.json' DiskId='1' Source='config\themes\high-contrast.json' KeyPath='yes'/>
+                            </Component>
+                        </Directory>
+                        <Component Id='Preferences' Guid='*'>
+                            <File Id='PreferencesFile' Name='preferences.json' DiskId='1' Source='config\preferences.json' KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+            <Directory Id='ProgramMenuFolder' Name='Programs'/>
+            <Directory Id='DesktopFolder' Name='Desktop'/>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs the client, the shared configuration and the license.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='LanguageEnglish'/>
+            <ComponentRef Id='LanguageChinese'/>
+            <ComponentRef Id='ThemeDefault'/>
+            <ComponentRef Id='ThemeDark'/>
+            <ComponentRef Id='ThemeLight'/>
+            <ComponentRef Id='ThemeHighContrast'/>
+            <ComponentRef Id='Preferences'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the install location of the Baihua executable to the PATH system environment variable.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+        <Icon Id='ProductICO' SourceFile='baihua-client-gui\assets\baihua.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/ChepleBob30/Baihua-Client'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+</Wix>

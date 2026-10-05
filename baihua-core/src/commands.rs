@@ -6,10 +6,10 @@
 //! This module is "shared code": it only deals with command names and language key names, not recognizing any interface type
 //! (no egui/epaint/ratatui), so anyone can use it and it's easy to test separately.
 
-/// 内置聊天命令表，元素为 (命令名, 描述文案的语言键名)，顺序即界面上的展示顺序。
+/// Built-in chat command table, entries are (command name, language key of the description); the order is the display order in the interfaces.
 ///
-/// 扩展新命令：在此追加条目，再在各界面执行命令的 match 里增加分支。
-/// `exit` 与 `quit` 是同一个动作的两个写法，两条都列出来供补全用。
+/// To add a command: append an entry here, then add a branch in each interface's command-execution match.
+/// `exit` and `quit` are two spellings of the same action; both are listed so completion offers them.
 pub fn chat_commands() -> Vec<(&'static str, &'static str)> {
     vec![
         ("quit", "command_quit"),
@@ -32,8 +32,8 @@ pub fn chat_commands() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// 按已经输入的命令名前缀过滤出可补全的条目。
-/// 前缀为空（只敲了一个斜杠）时返回整张表，让用户先看见有哪些命令。
+/// Filter the completable entries by the command-name prefix typed so far.
+/// An empty prefix (only a slash typed) returns the whole table so the person sees what exists.
 pub fn command_completions(prefix: &str) -> Vec<(&'static str, &'static str)> {
     chat_commands()
         .into_iter()
@@ -41,11 +41,11 @@ pub fn command_completions(prefix: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// 这个命令要不要跟参数。
+/// Whether this command takes an argument.
 ///
-/// 要参数的命令（如 `/kick 用户名`）在界面上点一下只把 `/命令名 ` 补进输入框，
-/// 由用户补完再回车；不要参数的命令点一下就直接执行。
-/// `/profile` 与 `/mute` 的参数是可选的，所以算"不要参数"：点一下先执行最常用的那一种。
+/// A command with an argument (like `/kick <username>`) only completes into the input box when clicked,
+/// leaving the person to type the argument and press Enter; a command without one runs immediately on click.
+/// The arguments of `/profile` and `/mute` are optional, so both count as "no argument": a click runs the most common form first.
 pub fn command_takes_argument(name: &str) -> bool {
     matches!(
         name,
@@ -53,16 +53,16 @@ pub fn command_takes_argument(name: &str) -> bool {
     )
 }
 
-/// 这个命令名是不是表里的完整已知命令。
+/// Whether this command name is a complete command known to the table.
 ///
-/// 用来区分"命令名已经敲全了"与"还在补全中"：敲全了按回车就是执行，
-/// 没敲全时按回车是先把补全提示里选中的那条补进输入框（终端版与图形版同一套）。
+/// Tells "the name is fully typed" apart from "still completing": Enter on a full name executes,
+/// Enter on a partial one first completes the highlighted entry into the input box (same rule in both interfaces).
 pub fn is_known_command(name: &str) -> bool {
     chat_commands().iter().any(|(known, _)| *known == name)
 }
 
-/// 命令名后面第一个空格之前的部分：输入框里正在敲的是哪条命令。
-/// 输入不是命令（不以斜杠开头，或已经敲完命令名开始写参数）时返回 None。
+/// The part after the command name up to the first space: which command the input box is still typing.
+/// Returns None when the text is not a command (no leading slash, or the name is finished and arguments started).
 pub fn pending_command_prefix(draft: &str) -> Option<&str> {
     let rest = draft.strip_prefix('/')?;
     if rest.contains(char::is_whitespace) {
@@ -71,9 +71,9 @@ pub fn pending_command_prefix(draft: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// 未登录时也允许用的命令（登录、注册、退出登录与不依赖账号的本地开关）。
-/// 其余命令在未登录时会被拒绝并提示先登录。
-pub fn command_allowed_signed_out(name: &str) -> bool {
+/// Commands allowed while signed out (login, register, sign out, and local switches that need no account).
+/// Every other command is rejected while signed out with a prompt to log in first.
+pub fn allowed_signed_out(name: &str) -> bool {
     matches!(
         name,
         "login"
@@ -92,23 +92,26 @@ pub fn command_allowed_signed_out(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// 命令表不许有重复命令名，否则补全列表里会出现两条一样的
+    /// The table must not repeat a command name, or the completion list would show the same entry twice
     #[test]
     fn command_names_are_unique() {
         let commands = chat_commands();
-        assert!(!commands.is_empty(), "命令表不能是空的");
+        assert!(!commands.is_empty(), "the command table must not be empty");
         let mut seen: Vec<&str> = Vec::new();
         for (name, _) in &commands {
-            assert!(!seen.contains(name), "命令表里出现了重复的命令 {name}");
+            assert!(
+                !seen.contains(name),
+                "the command table repeats the command {name}"
+            );
             assert!(
                 !name.starts_with('/') && !name.contains(char::is_whitespace),
-                "命令名写成裸名，不带斜杠也不带空格，实际 {name:?}"
+                "command names are bare, without a slash or a space, got {name:?}"
             );
             seen.push(name);
         }
     }
 
-    /// 前缀补全按前缀过滤，空前缀给出全部
+    /// Prefix completion filters by prefix; an empty prefix yields everything
     #[test]
     fn completions_filter_by_prefix() {
         assert_eq!(command_completions("").len(), chat_commands().len());
@@ -116,18 +119,18 @@ mod tests {
         assert_eq!(
             filtered.len(),
             1,
-            "以 li 开头的命令只有一条，实际 {filtered:?}"
+            "exactly one command starts with li, got {filtered:?}"
         );
         assert_eq!(filtered[0].0, "list_users");
-        assert!(command_completions("不存在的命令").is_empty());
+        assert!(command_completions("no such command").is_empty());
     }
 
-    /// 只有"正在敲命令名"时才补全，敲完命令名开始写参数就不再补全
+    /// Completion is pending only while the command name is being typed; once arguments start, it stops
     #[test]
     fn pending_prefix_stops_after_the_command_name() {
         assert_eq!(pending_command_prefix("/ki"), Some("ki"));
         assert_eq!(pending_command_prefix("/"), Some(""));
         assert_eq!(pending_command_prefix("/kick alice"), None);
-        assert_eq!(pending_command_prefix("普通消息"), None);
+        assert_eq!(pending_command_prefix("plain message"), None);
     }
 }

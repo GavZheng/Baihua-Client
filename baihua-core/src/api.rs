@@ -20,9 +20,9 @@ pub enum ConnectorError {
 }
 
 impl ConnectorError {
-    /// 是否为"服务端不可达"类错误（连接建立失败或超时），与服务端明确返回的业务错误区分。
-    /// 不可达会随轮询每两秒重复发生，界面只需在状态跳变时提示一次并以顶栏标记，
-    /// 因此调用方需要按类型而不是按错误文本判定（错误文本含本地化，字符串匹配不可靠）。
+    /// Whether an error is of the "server unreachable" family (the connection could not be established or timed out), kept apart from business errors the server answered deliberately.
+    /// Unreachability repeats with every two-second poll, so the interface should warn once on the transition and keep marking it in the top status bar,
+    /// which is why callers must classify by kind rather than by error text (the text is localized, string matching would lie).
     pub fn is_unreachable(&self) -> bool {
         match self {
             ConnectorError::Http(error) => error.is_connect() || error.is_timeout(),
@@ -34,9 +34,9 @@ impl ConnectorError {
 pub type Result<T> = std::result::Result<T, ConnectorError>;
 
 impl ConnectorError {
-    /// 是否为"连不上服务端"类故障（传输层失败：拒绝连接、DNS 解析失败、超时、连接被重置）。
-    /// 与业务错误（服务端明确回了错误码）区分开：前者会随每次轮询重复发生，
-    /// 界面只在状态跳变时提示一次并改由顶栏标记，不能逐次弹框。
+    /// Whether the failure is "cannot reach the server" at transport level (connection refused, DNS failure, timeout, reset).
+    /// Distinct from business errors (the server answered with an error code): the former repeats on every poll,
+    /// so the interface warns once at the transition and lets the status bar carry the state instead of popping a box each time.
     pub fn is_connection_failure(&self) -> bool {
         match self {
             ConnectorError::Http(error) => {
@@ -47,23 +47,23 @@ impl ConnectorError {
     }
 }
 
-/// 服务端 API 版本。所有随服务端版本变化的线上差异（响应成功码、端点路径、事件名、
-/// 报文格式、错误串、心跳/重连时序等）都应通过本枚举的 match 方法集中决策。
-/// 新增一个服务端版本 = 在此加一个变体，并在下方各 match 方法补一支分支即可，
-/// app.rs 等业务层不感知具体线上格式。
+/// Server API version. Every wire difference that follows the server version (response success codes, endpoint paths, event names,
+/// payload shapes, error strings, heartbeat and reconnect timing) is decided here through the match methods of this enum.
+/// Supporting a new server version means adding one variant here and one arm in each match method below;
+/// business layers such as app.rs never learn the concrete wire format.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ApiVersion {
-    /// 0.1.3：响应封装字段为 error_code，成功码 OK
+    /// 0.1.3: the response wrapper field is error_code, success code OK
     V0_1_3,
-    /// 0.1.4：响应封装字段改为 code，成功码 SUCCESS（私聊须经聊天请求建立）
+    /// 0.1.4: the wrapper field became code, success code SUCCESS (private chats must be opened through a chat request)
     V0_1_4,
-    /// 未识别版本：按最接近的已知兼容行为处理，并在探测时提示用户核对
+    /// Unrecognized version: behave like the closest known compatible version and ask the user to double-check during the probe
     Unknown,
 }
 
 impl ApiVersion {
-    /// 从 greet 返回的 server_version 字符串解析版本（按 major.minor.patch 前三段匹配，
-    /// 兼容前导 'v'）。次/修订号未识别时向上取最近的已知版本行为。
+    /// Parse the version from the server_version string the greet response returns (matched on the first three major.minor.patch segments, a leading 'v' tolerated).
+    /// When the minor or patch number is unknown the closest newer known version's behavior applies.
     pub fn from_version_string(version_text: &str) -> Self {
         let normalized = version_text.trim().trim_start_matches('v').to_string();
         let mut segments = normalized.split('.');
@@ -74,7 +74,7 @@ impl ApiVersion {
         }
     }
 
-    /// 该版本下 ApiResponse 视为成功的 code 取值集合（用元组切片表达，避免散落 if）
+    /// The set of code values ApiResponse treats as success on this version (a tuple slice, so no if-stacks scatter)
     pub fn success_codes(self) -> &'static [&'static str] {
         match self {
             ApiVersion::V0_1_3 => &["OK"],
@@ -82,9 +82,9 @@ impl ApiVersion {
         }
     }
 
-    /// 该版本下"取全部注册用户目录"应调用的端点路径。
-    /// 0.1.4 起路由表里 `/user/{user}` 会把 `/user/list` 当作用户名去查资料（必然 404），
-    /// 全量用户改用 `/user/search?username=`（服务端按 `ILIKE '%%'` 命中全部）配合分页取。
+    /// The endpoint path for "fetch the whole registered user directory" on this version.
+    /// Since 0.1.4 the route table reads `/user/list` as the username `/list` under `/user/{user}` (always a 404),
+    /// so the full directory goes through `/user/search?username=` (the server matches everything with `ILIKE '%%'`) plus paging.
     pub fn user_directory_endpoint(self) -> &'static str {
         match self {
             ApiVersion::V0_1_3 => "/api/v1/user/list",
@@ -92,8 +92,8 @@ impl ApiVersion {
         }
     }
 
-    /// 该版本下取用户目录是否需要客户端自己翻页聚合。
-    /// `/user/search` 单页上限 50 条，全量目录必须循环到 count；`/user/list` 一次返回全部。
+    /// Whether fetching the user directory needs client-side page aggregation on this version.
+    /// `/user/search` caps a page at 50 rows, so the full directory must loop until count; `/user/list` returns everything at once.
     pub fn user_directory_requires_paging(self) -> bool {
         match self {
             ApiVersion::V0_1_3 => false,
@@ -102,7 +102,7 @@ impl ApiVersion {
     }
 }
 
-/// Standard API response wrapper (0.1.4 字段为 code，兼容 0.1.3 的 error_code)
+/// Standard API response wrapper (field code on 0.1.4, compatible with error_code on 0.1.3)
 #[derive(Debug, Deserialize)]
 struct ApiResponse<T> {
     #[allow(dead_code)]
@@ -152,18 +152,18 @@ pub struct UserInfo {
     pub nickname: Option<String>,
     #[serde(default)]
     pub phone_number: Option<String>,
-    /// 个人简介，0.1.4 起服务端资料接口提供，旧版本按缺失处理
+    /// Bio text, served by the profile endpoint since 0.1.4; treated as missing on older versions
     #[serde(default)]
     pub bio: Option<String>,
-    /// 头像地址（服务端上传头像写入 /static/avatars/... 相对路径，自定义资料可写完整 URL）
+    /// Avatar address (an uploaded avatar stores a /static/avatars/... relative path; a custom profile may hold a full URL)
     #[serde(default)]
     pub avatar: Option<String>,
     pub created_at: String,
     pub is_active: bool,
 }
 
-/// 他人资料的对外视图（GET /api/v1/user/{user} 的 data.user）。
-/// 服务端刻意不返回邮箱与手机号，故独立建模而非复用 UserInfo。
+/// Public view of another user's profile (the data.user of GET /api/v1/user/{user}).
+/// The server deliberately hides email and phone, so this is modeled apart instead of reusing UserInfo.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PublicProfile {
     pub id: String,
@@ -176,9 +176,9 @@ pub struct PublicProfile {
     pub avatar: Option<String>,
 }
 
-/// 资料更新载荷（PATCH /api/v1/user/me）。服务端以"字段缺省=保持原值、显式 null=清空、
-/// 非空字符串=校验后写入"三态语义处理，故此处用 Option<Option<String>> 表达，
-/// 并让缺省外层不进 JSON，避免把未编辑的字段误清空。
+/// Profile update payload (PATCH /api/v1/user/me). The server treats "field absent = keep current, explicit null = clear,
+/// non-empty string = validate then write" as three states, which is why this uses Option<Option<String>>
+/// and lets the outer default stay out of the JSON, so untouched fields are never cleared by accident.
 #[derive(Debug, Serialize, Default, Clone)]
 pub struct ProfileUpdatePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,15 +191,15 @@ pub struct ProfileUpdatePayload {
     pub avatar: Option<Option<String>>,
 }
 
-/// 修改密码载荷（PATCH /api/v1/user/me/password）。
-/// 两个口令均与登录使用同一客户端变换，服务端对变换结果做 bcrypt 校验。
+/// Password change payload (PATCH /api/v1/user/me/password).
+/// Both passwords go through the same client-side transform login uses; the server bcrypt-checks the transformed values.
 #[derive(Debug, Serialize, Clone)]
 pub struct ChangePasswordRequest {
     pub old_password: String,
     pub new_password: String,
 }
 
-/// 注销账户载荷（DELETE /api/v1/user/me）：服务端删除前复核一次口令
+/// Account deletion payload (DELETE /api/v1/user/me): the server re-checks the password before deleting
 #[derive(Debug, Serialize, Clone)]
 pub struct DeleteAccountRequest {
     pub password: String,
@@ -218,7 +218,7 @@ pub struct LoginData {
     pub user: UserInfo,
 }
 
-/// 群聊创建请求（0.1.4 起私聊不再直接创建，须经聊天请求接受后由服务器建房间）
+/// Group chat creation request (since 0.1.4 private chats are not created directly; an accepted chat request makes the server open the room)
 #[derive(Debug, Serialize, Clone)]
 pub struct CreateRoomRequest {
     pub is_group: bool,
@@ -236,20 +236,20 @@ impl CreateRoomRequest {
     }
 }
 
-/// 房间信息
+/// Room information
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct RoomInfo {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// 建房者。`rooms.created_by` 是 `ON DELETE SET NULL`：建房的人注销后这里就返回 null。
-    /// 按 String 反序列化会让**整份**房间列表解码失败（表现成"所有房间都打不开"），
-    /// 所以把 null 收敛成空串，显示侧再退回"未知"。
+    /// The room founder. `rooms.created_by` is `ON DELETE SET NULL`: after the founder deletes the account this comes back null.
+    /// Deserializing it as String makes the **entire** room list fail to decode (every room appears broken),
+    /// so null collapses to an empty string and the display side falls back to "unknown".
     #[serde(default, deserialize_with = "null_to_empty_string")]
     pub created_by: String,
     pub created_at: String,
     pub is_group: bool,
-    /// 该房间是否为端到端加密房间（随聊天请求的加密标志建立）
+    /// Whether this room is end-to-end encrypted (established with the chat request's encryption flag)
     #[serde(default)]
     pub is_encrypted: bool,
     pub members: Vec<String>,
@@ -261,12 +261,12 @@ pub struct RoomDetail {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// 同 `RoomInfo::created_by`：账号注销后为 null，不能因此废掉整个房间详情。
+    /// Same as `RoomInfo::created_by`: null after the account is deleted, which must not void the whole room detail.
     #[serde(default, deserialize_with = "null_to_empty_string")]
     pub created_by: String,
     pub created_at: String,
     pub is_group: bool,
-    /// 该房间是否为端到端加密房间
+    /// Whether this room is end-to-end encrypted
     #[serde(default)]
     pub is_encrypted: bool,
     pub member_count: usize,
@@ -329,20 +329,20 @@ pub struct RemoveMemberData {
 pub struct MessageInfo {
     pub id: String,
     pub room_id: String,
-    /// 发送者。`messages.sender_id` 同样是 `ON DELETE SET NULL`：发言人注销后为 null。
-    /// 一条消息读不出来就会废掉整页历史，故同样收敛成空串，显示侧退回"未知用户"。
+    /// The sender. `messages.sender_id` is also `ON DELETE SET NULL`: null once that person's account is gone.
+    /// One unreadable message would void the whole page of history, so this also collapses to an empty string and the display shows "unknown user".
     #[serde(default, deserialize_with = "null_to_empty_string")]
     pub sender_id: String,
-    /// 加密房间的历史消息此字段为 null（密文存于 encrypted_content），按空串收下。
-    /// 空内容只是"这条历史消息没有可读正文"的记号，具体显示什么占位文案由各界面按自己的语言表决定
-    /// （语言键 `message_encrypted_history_unavailable`）：核心层不写死某一种语言的提示。
+    /// In encrypted rooms this field is null (the ciphertext lives in encrypted_content); accepted as an empty string.
+    /// An empty content is only the marker "this history message has no readable body"; each interface picks the placeholder text from its own language table
+    /// (key `message_encrypted_history_unavailable`): the core layer never hard-codes a hint in one language.
     #[serde(default, deserialize_with = "null_to_empty_string")]
     pub content: String,
     pub created_at: String,
 }
 
-/// 服务端可空字段（引用用户被删后为 null、加密房间的正文为 null）统一按空串收下：
-/// 键缺失与显式 null 两种情况都要接住，否则整批数据一起废掉。
+/// Server-null fields (null after the referenced user is deleted, null body in encrypted rooms) all arrive as empty strings:
+/// both a missing key and an explicit null must be caught or the whole batch fails.
 fn null_to_empty_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -360,7 +360,7 @@ pub struct MessagesData {
     pub next_cursor: Option<String>,
 }
 
-/// 用户搜索结果条目（用户目录列表与关键字搜索共用同一批公开字段）
+/// A user search result entry (the directory listing and keyword search share the same public fields)
 #[derive(Debug, Deserialize, Clone)]
 pub struct UserSearchResult {
     pub id: String,
@@ -373,7 +373,7 @@ pub struct UserSearchResult {
     pub avatar: Option<String>,
 }
 
-/// `/user/search` 的单页响应：除条目外还要服务端报告的总命中数，供翻页聚合判定终点
+/// One page of `/user/search`: besides the entries it carries the server-reported total hit count so the aggregation loop knows where to stop
 #[derive(Debug, Deserialize, Clone)]
 struct UserSearchPage {
     users: Vec<UserSearchResult>,
@@ -382,7 +382,7 @@ struct UserSearchPage {
 }
 
 impl From<UserInfo> for UserSearchResult {
-    /// 完整用户对象降级为公开条目：邮箱与手机号不属于对外展示字段，一律不带出
+    /// Downgrade a full user object to public entries: email and phone are never shown to outsiders and are always dropped
     fn from(user: UserInfo) -> Self {
         Self {
             id: user.id,
@@ -394,7 +394,7 @@ impl From<UserInfo> for UserSearchResult {
     }
 }
 
-/// 聊天请求中的对端描述（接收列表里是发送者，已发送列表里是接收者）
+/// The counterparty in a chat request (the sender in the received list, the receiver in the sent list)
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct RoomRequestPeer {
     pub user_id: String,
@@ -403,7 +403,7 @@ pub struct RoomRequestPeer {
     pub nickname: Option<String>,
 }
 
-/// 聊天请求条目（待处理/已发送列表共用）
+/// A chat request entry (shared by the pending and sent lists)
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct RoomRequestInfo {
     pub id: String,
@@ -418,7 +418,7 @@ pub struct RoomRequestInfo {
     pub status: Option<String>,
 }
 
-/// 聊天请求创建载荷
+/// Chat request creation payload
 #[derive(Debug, Serialize, Clone)]
 pub struct CreateRoomRequestPayload {
     pub receiver_id: String,
@@ -426,19 +426,31 @@ pub struct CreateRoomRequestPayload {
     pub message: String,
 }
 
-/// 聊天请求状态变更结果（创建/接受/拒绝/撤回共用）
+/// Result of a chat request state change (shared by create, accept, decline and cancel)
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoomRequestStatusResult {
     pub request_id: String,
     pub status: String,
 }
 
-/// 接受聊天请求的结果，含服务器创建的私密房间
+/// Result of accepting a chat request, including the private room the server created
 #[derive(Debug, Deserialize, Clone)]
 pub struct AcceptedRoomRequest {
     pub request_id: String,
     pub status: String,
     pub room: RoomInfo,
+}
+
+/// Android-only: the built-in (Mozilla) root certificate set converted to the
+/// request library's certificate type. Entries that fail to parse are dropped --
+/// the list is a stable, vendor-maintained set, so a drop would be a build
+/// anomaly, not a runtime concern; verification keeps every usable anchor.
+#[cfg(target_os = "android")]
+fn android_trusted_root_certificates() -> Vec<reqwest::Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|root| reqwest::Certificate::from_der(root.as_ref()).ok())
+        .collect()
 }
 
 /// Centralized network communication component for Baihua Server
@@ -447,20 +459,29 @@ pub struct Connector {
     client: Client,
     base_url: String,
     token: Option<String>,
-    /// 探测得到的服务端 API 版本，决定成功码等线上差异；默认按最新已知版本
+    /// The server API version learned by probing; decides success codes and other wire differences; defaults to the newest known version
     version: ApiVersion,
-    /// 服务端 greet 回报的原始版本串（未经归一化，用于界面向用户展示"服务端版本"）；
-    /// 未探测或探测失败时为空串
+    /// The raw version string the server greeted with (not normalized, shown to users as "server version");
+    /// an empty string when no probe has succeeded
     server_version_text: String,
 }
 
 impl Connector {
     /// Create a new Connector with the given base URL
     pub fn new(base_url: &str) -> Self {
-        let client = Client::builder()
+        let builder = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
+            // A dead or firewalled server must never strand a caller for the
+            // full request timeout: TCP connect gives up after three seconds
+            // (the startup black screen the developers saw was a 30-second
+            // connect timeout blocking the first frame).
+            .connect_timeout(std::time::Duration::from_secs(3));
+        // See the dependency note in `baihua-core/Cargo.toml`: on Android the
+        // platform trust store is not reachable from this packaging path, so
+        // verification runs against the compiled-in root set instead.
+        #[cfg(target_os = "android")]
+        let builder = builder.tls_certs_only(android_trusted_root_certificates());
+        let client = builder.build().expect("Failed to create HTTP client");
 
         Self {
             client,
@@ -471,19 +492,28 @@ impl Connector {
         }
     }
 
+    /// Adopt a probe run earlier on another (cloned) connector: store the wire
+    /// version and the raw greeting text without touching the network. The
+    /// graphical client probes in a background startup thread and hands the
+    /// verdict back to the authoritative connector on the UI thread.
+    pub fn adopt_probe_result(&mut self, version: ApiVersion, server_version_text: &str) {
+        self.version = version;
+        self.server_version_text = server_version_text.to_string();
+    }
+
     /// Set the JWT authentication token
     pub fn set_token(&mut self, token: &str) {
         self.token = Some(token.to_string());
     }
 
-    /// 当前生效的服务端 API 版本
+    /// The server API version currently in effect
     pub fn version(&self) -> ApiVersion {
         self.version
     }
 
-    /// 探测服务端版本：调用 greet 读取 server_version（回退 api_version）解析并记录。
-    /// 登录成功、启动自动登录、切换服务器地址后应调用，使后续线上决策匹配真实版本。
-    /// 返回 (探测到的版本, 原始版本串)；原始串供界面提示"未识别版本"时使用
+    /// Probe the server version: call greet, read server_version (falling back to api_version), parse and record it.
+    /// Call it after a successful login, an automatic login at startup, or a server address switch so later wire decisions match the real version.
+    /// Returns (probed version, raw version string); the interface shows the raw string with its "unrecognized version" warning
     pub fn probe_version(&mut self) -> Result<(ApiVersion, String)> {
         let greet = self.greet()?;
         let raw = if !greet.server_version.is_empty() {
@@ -497,10 +527,10 @@ impl Connector {
         Ok((detected, raw))
     }
 
-    /// 只做"服务端是否可达"的轻量探测：请求 greet，短超时，
-    /// 收到任何 HTTP 响应都算可达（业务码不在这里判断，那是各接口自己的事）。
-    /// 界面顶栏的连接标记由独立探测线程按这个结论维护——它不依赖登录态与业务请求，
-    /// 因此退出登录、服务端刚重启、业务接口偶发超时都不会把连接状态带偏。
+    /// A lightweight "is the server reachable" probe: request greet with a short timeout;
+    /// any HTTP response counts as reachable (business codes are each endpoint's own concern, not this one).
+    /// The status bar's connection mark is maintained by a dedicated probe thread on this verdict — it does not depend on the sign-in state or business requests,
+    /// so signing out, a server restart, or an occasional business timeout never skew the connection state.
     pub fn probe_reachable(&self) -> bool {
         let url = format!("{}/greet", self.base_url);
         self.client
@@ -511,12 +541,12 @@ impl Connector {
             .unwrap_or(false)
     }
 
-    /// 最近一次探测到的服务端原始版本串；未探测成功时为空串（界面据此决定显示还是留空）
+    /// The raw server version string from the last successful probe; empty when no probe succeeded (the interface shows or hides it accordingly)
     pub fn server_version_text(&self) -> &str {
         &self.server_version_text
     }
 
-    /// 清空已记录的服务端版本（切换服务器地址时调用，避免界面继续显示旧地址的版本）
+    /// Forget the recorded server version (called when the address changes so the interface stops showing the old server's version)
     pub fn clear_server_version(&mut self) {
         self.server_version_text.clear();
     }
@@ -543,7 +573,7 @@ impl Connector {
         Ok(headers)
     }
 
-    /// Parse API response, handling error codes (成功码取值随 ApiVersion 变化，集中在此判定)
+    /// Parse API response, handling error codes (the accepted success values follow ApiVersion and are decided here)
     fn parse_response<T: for<'de> Deserialize<'de>>(
         &self,
         response: reqwest::blocking::Response,
@@ -673,12 +703,12 @@ impl Connector {
         self.parse_response(response)
     }
 
-    /// GET /api/v1/user/search?username= - 按用户名模糊搜索活跃用户
+    /// GET /api/v1/user/search?username= - fuzzy search active users by username
     pub fn search_users(&self, username: &str) -> Result<Vec<UserSearchResult>> {
         Ok(self.search_users_page(username, 0, 50)?.users)
     }
 
-    /// 按关键字取一页用户搜索结果（服务端单页上限 50，超出会被静默截断）
+    /// Fetch one page of user search results for a keyword (the server caps pages at 50 and silently truncates beyond)
     fn search_users_page(&self, username: &str, offset: u32, limit: u32) -> Result<UserSearchPage> {
         let url = format!(
             "{}/api/v1/user/search?username={}&limit={}&offset={}",
@@ -692,9 +722,9 @@ impl Connector {
         self.parse_response(response)
     }
 
-    /// 取全部注册用户目录。路径与是否翻页由 ApiVersion 决定：
-    /// 0.1.4 没有 `/user/list`（该路径会被 `/user/{user}` 当用户名查资料），
-    /// 只能用空关键字的 `/user/search` 逐页聚合，服务端按 `ILIKE '%%'` 命中全部活跃用户。
+    /// Fetch the directory of all registered users. The path and the paging are decided by ApiVersion:
+    /// 0.1.4 has no `/user/list` (the route would read "list" as a username under `/user/{user}`),
+    /// so the only option is aggregating `/user/search` pages with an empty keyword, matching every active user via `ILIKE '%%'`.
     pub fn list_all_users(&self) -> Result<Vec<UserSearchResult>> {
         let endpoint = self.version.user_directory_endpoint();
         let url = format!("{}{}", self.base_url, endpoint);
@@ -713,7 +743,7 @@ impl Connector {
                 .map(UserSearchResult::from)
                 .collect());
         }
-        // 分页聚合：以 count 为终点，单页取满服务端上限；服务端不认 offset 时靠空页兜底退出
+        // Page aggregation: stop at count, take full pages; when the server ignores offset, an empty page ends the loop
         let mut directory: Vec<UserSearchResult> = Vec::new();
         let mut offset: u32 = 0;
         loop {
@@ -731,7 +761,7 @@ impl Connector {
         Ok(directory)
     }
 
-    /// GET /api/v1/user/{user} - 取任一用户的公开资料（用户名或 UID 均可，服务端同形返回）
+    /// GET /api/v1/user/{user} - read any user's public profile (username or UID both work, same shape back)
     pub fn get_user_profile(&self, user_key: &str) -> Result<PublicProfile> {
         let url = format!(
             "{}/api/v1/user/{}",
@@ -748,7 +778,7 @@ impl Connector {
         Ok(self.parse_response::<ProfileWrapper>(response)?.user)
     }
 
-    /// PATCH /api/v1/user/me - 更新自己的资料，成功时返回服务端持久化后的完整用户
+    /// PATCH /api/v1/user/me - update one's own profile; on success the persisted full user comes back
     pub fn update_profile(&self, payload: &ProfileUpdatePayload) -> Result<UserInfo> {
         let url = format!("{}/api/v1/user/me", self.base_url);
         let headers = self.headers()?;
@@ -766,9 +796,9 @@ impl Connector {
         Ok(self.parse_response::<UserWrapper>(response)?.user)
     }
 
-    /// PATCH /api/v1/user/me/password - 修改密码。
-    /// 服务端会同步抬高 token_version，使此前签发的全部 JWT（含本端保存的会话）立即失效，
-    /// 因此调用成功后客户端必须清除本地会话并要求重新登录。
+    /// PATCH /api/v1/user/me/password - change the password.
+    /// The server bumps token_version, instantly invalidating every JWT it issued before (including this client's session),
+    /// so after a success the client must drop its stored session and demand a new login.
     pub fn change_password(&self, old_password: &str, new_password: &str) -> Result<String> {
         let url = format!("{}/api/v1/user/me/password", self.base_url);
         let headers = self.headers()?;
@@ -785,7 +815,7 @@ impl Connector {
         self.parse_message_response(response)
     }
 
-    /// DELETE /api/v1/user/me - 注销账户（服务端复核口令后硬删除，成员关系与聊天请求级联清除）
+    /// DELETE /api/v1/user/me - delete the account (the server re-checks the password then hard-deletes; memberships and chat requests cascade)
     pub fn delete_account(&self, password: &str) -> Result<String> {
         let url = format!("{}/api/v1/user/me", self.base_url);
         let headers = self.headers()?;
@@ -801,8 +831,8 @@ impl Connector {
         self.parse_message_response(response)
     }
 
-    /// POST /api/v1/user/me/avatar - 上传头像图片（multipart 字段名 file）。
-    /// 服务端仅接受 JPEG/PNG/GIF/WebP，成功后把 avatar 字段指向 /static/avatars/{文件名}
+    /// POST /api/v1/user/me/avatar - upload an avatar image (multipart field name file).
+    /// The server accepts only JPEG/PNG/GIF/WebP and on success points the avatar field at /static/avatars/{filename}
     pub fn upload_avatar(
         &self,
         file_name: &str,
@@ -810,7 +840,7 @@ impl Connector {
         bytes: Vec<u8>,
     ) -> Result<UserInfo> {
         let url = format!("{}/api/v1/user/me/avatar", self.base_url);
-        // blocking 接口的 Part 只开放 headers()，图片类型按 CONTENT_TYPE 头给出
+        // The blocking client's multipart Part only exposes headers(), so the image type travels in a CONTENT_TYPE header
         let mut part_headers = HeaderMap::new();
         part_headers.insert(
             CONTENT_TYPE,
@@ -823,7 +853,7 @@ impl Connector {
             .headers(part_headers);
         let form = reqwest::blocking::multipart::Form::new().part("file", part);
         let mut headers = self.headers()?;
-        // multipart 的 boundary 由 reqwest 生成，必须交还给服务端解析，不能沿用固定的 JSON 头
+        // reqwest generates the multipart boundary, which must be handed back for the server to parse instead of a fixed JSON header
         headers.remove(CONTENT_TYPE);
         let response = self
             .client
@@ -839,8 +869,8 @@ impl Connector {
         Ok(self.parse_response::<UserWrapper>(response)?.user)
     }
 
-    /// 拉取头像等公开静态资源（服务端刻意不校验令牌，图片路径直接 GET）。
-    /// 服务端写入的 avatar 值可能是 `/static/avatars/...` 相对路径，需按 base_url 补全
+    /// Fetch a public static resource such as an avatar (the server skips token checks here; the image path is a plain GET).
+    /// A server-written avatar value may be a `/static/avatars/...` relative path, so it is completed against base_url
     pub fn fetch_static_resource(&self, resource_path: &str) -> Result<Vec<u8>> {
         let url = if resource_path.starts_with("http://") || resource_path.starts_with("https://") {
             resource_path.to_string()
@@ -857,7 +887,7 @@ impl Connector {
         Ok(response.bytes()?.to_vec())
     }
 
-    /// 解析只关心成败、data 恒为 null 的响应（改密码、注销账户），成功时返回服务端文案
+    /// Parse responses whose data is always null (password change, account deletion), returning the server's message on success
     fn parse_message_response(&self, response: reqwest::blocking::Response) -> Result<String> {
         let api_response: ApiResponse<serde_json::Value> = response.json()?;
         if self
@@ -874,7 +904,7 @@ impl Connector {
         }
     }
 
-    /// POST /api/v1/chat/rooms/requests - 发送聊天请求（0.1.4 建立私聊的唯一途径）
+    /// POST /api/v1/chat/rooms/requests - send a chat request (the only way to open a private chat on 0.1.4)
     pub fn create_room_request(
         &self,
         receiver_id: &str,
@@ -897,7 +927,7 @@ impl Connector {
         self.parse_response(response)
     }
 
-    /// GET /api/v1/chat/rooms/requests/pending - 当前用户待处理的聊天请求列表
+    /// GET /api/v1/chat/rooms/requests/pending - the chat requests awaiting the current user
     pub fn list_pending_requests(&self) -> Result<Vec<RoomRequestInfo>> {
         let url = format!("{}/api/v1/chat/rooms/requests/pending", self.base_url);
         let headers = self.headers()?;
@@ -911,7 +941,7 @@ impl Connector {
         Ok(wrapper.requests)
     }
 
-    /// GET /api/v1/chat/rooms/requests/sent - 当前用户已发送的聊天请求列表
+    /// GET /api/v1/chat/rooms/requests/sent - the chat requests the current user has sent
     pub fn list_sent_requests(&self) -> Result<Vec<RoomRequestInfo>> {
         let url = format!("{}/api/v1/chat/rooms/requests/sent", self.base_url);
         let headers = self.headers()?;
@@ -925,7 +955,7 @@ impl Connector {
         Ok(wrapper.requests)
     }
 
-    /// POST /api/v1/chat/rooms/requests/{request_id}/accept - 接受聊天请求，服务器随后创建私密房间
+    /// POST /api/v1/chat/rooms/requests/{request_id}/accept - accept a chat request; the server then creates the private room
     pub fn accept_room_request(&self, request_id: &str) -> Result<AcceptedRoomRequest> {
         let url = format!(
             "{}/api/v1/chat/rooms/requests/{}/accept",
@@ -936,7 +966,7 @@ impl Connector {
         self.parse_response(response)
     }
 
-    /// POST /api/v1/chat/rooms/requests/{request_id}/decline - 拒绝聊天请求
+    /// POST /api/v1/chat/rooms/requests/{request_id}/decline - decline a chat request
     pub fn decline_room_request(&self, request_id: &str) -> Result<RoomRequestStatusResult> {
         let url = format!(
             "{}/api/v1/chat/rooms/requests/{}/decline",
@@ -947,7 +977,7 @@ impl Connector {
         self.parse_response(response)
     }
 
-    /// POST /api/v1/chat/rooms/requests/{request_id}/cancel - 撤回自己发送的聊天请求
+    /// POST /api/v1/chat/rooms/requests/{request_id}/cancel - withdraw a chat request one sent
     pub fn cancel_room_request(&self, request_id: &str) -> Result<RoomRequestStatusResult> {
         let url = format!(
             "{}/api/v1/chat/rooms/requests/{}/cancel",
@@ -959,7 +989,7 @@ impl Connector {
     }
 }
 
-/// 按 RFC 3986 未保留字符集对查询参数做百分号编码
+/// Percent-encode a query parameter keeping only the RFC 3986 unreserved characters
 fn encode_query_component(text: &str) -> String {
     let mut encoded = String::new();
     for byte in text.bytes() {
@@ -979,71 +1009,79 @@ impl Default for Connector {
     }
 }
 
-// ======================= WebSocket 线协议接缝（入站）=======================
-// 本节是"服务端 WebSocket 推送报文"与"客户端领域事件 PollingEvent"之间的唯一翻译层。
-// 事件 type 字符串、字段名、错误文案等线上事实集中于此，业务层(app.rs)只见领域事件。
-// 未来某版本改名/改结构时，在本节按 ApiVersion 增补 match 即可，app.rs 不感知。
+// ======================= WebSocket wire protocol seam (inbound) =======================
+// This section is the only translation layer between server WebSocket push messages and the client domain event PollingEvent.
+// Wire facts (event type strings, field names, error texts) live only here; the business layer (app.rs) sees domain events.
+// When a future version renames or reshapes anything, extend the ApiVersion matches here; app.rs stays unaware.
 
-/// 后台线程（轮询/WebSocket）发往主循环的领域事件。变体名与线上 type 字符串解耦。
+/// Domain events the background threads (polling / WebSocket) send to the main loop. Variant names are decoupled from wire type strings.
 #[derive(Debug, Clone)]
 pub enum PollingEvent {
-    /// 更新后的房间列表
+    /// The refreshed room list
     RoomsUpdated(Vec<RoomInfo>),
-    /// 更新后的待处理聊天请求列表（别人发给自己的）
+    /// The refreshed list of pending chat requests (received from others)
     PendingRequestsUpdated(Vec<RoomRequestInfo>),
-    /// 自己发出的聊天请求列表（用于私聊管理页面展示与撤回）
+    /// The list of chat requests one sent (shown on the private-chat management page and used for withdrawal)
     SentRequestsUpdated(Vec<RoomRequestInfo>),
-    /// 自己发送的消息被服务器确认收到
+    /// The server confirmed a message one sent
     MessageSent(MessageInfo),
-    /// 其他成员发送的新消息（实时推送）
+    /// A new message from another member (pushed in real time)
     IncomingMessage(MessageInfo),
-    /// 对端发起的加密会话邀请
+    /// An encryption-session invitation from the peer
     EncryptInvitation(EncryptHandshakeData),
-    /// 对端对加密会话邀请的接受回应
+    /// The peer's acceptance of an encryption-session invitation
     EncryptAccepted(EncryptHandshakeData),
-    /// 双方就绪，加密会话激活（房间 ID）
+    /// Both sides ready, the encryption session activates (room id)
     EncryptSessionReady(String),
-    /// 收到加密消息（密文）
+    /// An encrypted message arrived (ciphertext)
     EncryptedMessage(EncryptedMessageInfo),
-    /// 自己发送的加密消息被服务器确认（消息 ID 回执）
+    /// The server confirmed an encrypted message one sent (message id receipt)
     EncryptedMessageSent(String),
-    /// 加密会话结束（房间 ID, 结束原因）
+    /// The encryption session ended (room id, reason)
     EncryptSessionEnded((String, String)),
-    /// 某成员正在输入（房间 ID, 用户 ID, 用户名）。服务端只有 typing 为真一种帧、
-    /// 没有"停止输入"信号，接收方需按本地超时窗口衰减
+    /// A member is typing (room id, user id, username). The server only ever sends frames with typing true,
+    /// never a "stopped typing" signal, so receivers decay the indicator on a local timeout window
     MemberTyping((String, String, String)),
-    /// 成员在线状态跳变（用户 ID, 用户名, 是否在线）。服务端仅在连接数 0↔1 跳变时广播，
-    /// 且建立连接时不下发当前在线名单基线，客户端只能累积跳变结果
+    /// A member's online state flipped (user id, username, online). The server broadcasts only on connection-count 0-to-1 flips
+    /// and sends no baseline roster when a connection opens, so clients can only accumulate the flips
     PresenceChanged((String, String, bool)),
-    /// 本端 WebSocket 自身的状态变化（文案键名）。它不是服务端错误，
-    /// 必须与 Error 分开：Error 分支会拿本地化后的文本去匹配服务端的英文错误串，
-    /// 本地化串永远匹配不上，于是每次瞬时的连接抖动都会弹一个错误框再自愈（表现为"莫名报错后自己好了"）。
-    /// 键名 error_ws_disconnected_reconnect / error_ws_connect_failed 属可自愈抖动，只记调试日志；
-    /// 键名 error_ws_send_failed 说明确有一条报文没发出去，需要提示用户。
+    /// A state change of this client's own WebSocket (given as a text key). It is not a server error
+    /// and must stay apart from Error: the Error branch matches localized text against the server's English error strings,
+    /// a match that can never happen, so every transient connection blip would pop an error box before self-healing (the "mystery error that fixed itself" symptom).
+    /// The keys error_ws_disconnected_reconnect / error_ws_connect_failed are self-healing blips: debug log only;
+    /// error_ws_send_failed means one message genuinely did not leave and the user must be told.
     WebSocketState(String),
-    /// 服务端可达性跳变（true 表示恢复可达）。轮询每两秒一次，服务端宕机时同一故障会反复触发，
-    /// 若按普通 Error 处理会弹出一串相同报错，故此处只报跳变、由界面在跳变为不可达时提示一次，
-    /// 之后改由顶栏的连接标记持续反映状态。
+    /// The server reachability flipped (true means reachable again). Polling runs every two seconds, so one outage retriggers endlessly;
+    /// handled as a plain Error that would stack identical popups, so only transitions are reported and the interface warns once,
+    /// after which the status-bar connection mark carries the state.
     ReachabilityChanged(bool),
-    /// 头像已取回（用户 ID, 图片字节；None 表示该用户没有头像或取回失败）。
-    /// 资料接口只给头像路径，字节由后台线程拉取，界面收到后按需解码并缓存，渲染期不做网络动作。
-    /// 取不到也要回报一次，界面据此标记"已尝试过"，不会为同一个用户反复联网。
+    /// An avatar was fetched (user id, image bytes; None means no avatar or a failed fetch).
+    /// The profile endpoint only gives a path; a background thread pulls the bytes, the interface decodes and caches on demand, and the render path never touches the network.
+    /// A failed fetch is still reported once so the interface marks "already tried" and stops re-requesting for the same user.
     AvatarLoaded((String, Option<Vec<u8>>)),
-    /// 服务端全部注册用户目录已取回（/profile 的自动补全用）。拉取只在用户打出
-    /// "/profile " 的那一刻发起一次，结果交回主线程缓存，渲染路径里绝不发请求。
+    /// The desktop avatar file picker finished: Some is a chosen image path, None a
+    /// cancel. It rides the same channel as the network threads so the dialog never blocks a frame.
+    AvatarFileChosen(Option<std::path::PathBuf>),
+    /// The full registered-user directory arrived (used by /profile autocompletion). The pull starts only the moment the user types
+    /// "/profile ", runs exactly once, and the main thread caches the result; the render path never issues requests.
     RegisteredUsersUpdated(Vec<UserSearchResult>),
-    /// 新版本已下载并通过校验（新版本号, 本地安装包路径）。此时才值得通知用户，
-    /// 通知即意味着 /update 可以立刻完成，不会再出现"提示有更新但下载要等半天"的情况。
+    /// The release feed offered a newer package for this platform. The interface prompts the
+    /// user first and downloads only after the answer; nothing is fetched without consent.
+    UpdateAvailable(crate::update::ReleasePackage),
+    /// The feed has nothing newer than the running version (the version that was checked).
+    UpdateUpToDate(String),
+    /// A newer package was downloaded and verified (new version, local package path). The
+    /// interface installs it right away and closes itself for the detached installer.
     UpdateReady((String, std::path::PathBuf)),
-    /// WebSocket 连接就绪：服务器已完成房间订阅，可以安全发送握手与消息
+    /// The WebSocket is ready: the server completed room subscriptions, handshakes and messages can be sent safely
     WebSocketConnected,
-    /// 退出清理流程在后台执行完毕，可以安全退出应用
+    /// The exit cleanup finished in the background and the application may quit safely now
     QuitCleanupFinished,
-    /// 轮询或连接错误
+    /// A polling or connection error
     Error(String),
 }
 
-/// 加密握手数据（邀请与接受回应共用，peer 为对端）
+/// Encryption handshake data (shared by invitation and acceptance; peer is the counterparty)
 #[derive(Debug, Clone)]
 pub struct EncryptHandshakeData {
     pub room_id: String,
@@ -1053,7 +1091,7 @@ pub struct EncryptHandshakeData {
     pub signature: String,
 }
 
-/// 加密消息载荷（密文，解密前不含明文）
+/// Encrypted message payload (ciphertext, no plaintext before decryption)
 #[derive(Debug, Clone)]
 pub struct EncryptedMessageInfo {
     pub id: String,
@@ -1063,7 +1101,7 @@ pub struct EncryptedMessageInfo {
     pub created_at: String,
 }
 
-/// 将服务器推送的 WebSocket 文本消息解析为领域事件；无法识别的内容返回 None
+/// Parse a server-pushed WebSocket text message into a domain event; unrecognized content yields None
 pub fn parse_websocket_event(text: &str, tr: &dyn Fn(&str) -> String) -> Option<PollingEvent> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let event_type = value.get("type")?.as_str()?;
@@ -1100,12 +1138,12 @@ pub fn parse_websocket_event(text: &str, tr: &dyn Fn(&str) -> String) -> Option<
         "encrypt_partner_disconnected" => {
             Some(PollingEvent::Error(tr("warning_partner_disconnected")))
         }
-        // 连接回执：服务器在此之后才会把后续广播投递给本连接
+        // Connection receipt: only after it does the server deliver later broadcasts to this connection
         "connected" => Some(PollingEvent::WebSocketConnected),
-        // 成员在线状态跳变：服务端只在该用户连接数 0↔1 时各广播一次
+        // Member online flips: the server broadcasts once per 0-to-1 / 1-to-0 connection-count change
         "user_online" => parse_presence(data, true),
         "user_offline" => parse_presence(data, false),
-        // 输入状态：服务端只广播 typing 为真的帧，接收端按本地窗口衰减
+        // Typing state: the server only broadcasts typing-true frames; receivers decay locally
         "typing" => Some(PollingEvent::MemberTyping((
             data.get("room_id")?.as_str()?.to_string(),
             data.get("user_id")?.as_str()?.to_string(),
@@ -1125,8 +1163,8 @@ pub fn parse_websocket_event(text: &str, tr: &dyn Fn(&str) -> String) -> Option<
     }
 }
 
-/// 解析在线状态跳变广播（user_online / user_offline）。
-/// user_id 必需；username 为可选字段，缺失时以空串兜底，绝不因单个可选字段丢弃整条状态变更。
+/// Parse an online-state flip broadcast (user_online / user_offline).
+/// user_id is required; username is optional and falls back to an empty string — a single optional field must never discard the whole state change.
 fn parse_presence(data: &serde_json::Value, is_online: bool) -> Option<PollingEvent> {
     Some(PollingEvent::PresenceChanged((
         data.get("user_id")?.as_str()?.to_string(),
@@ -1138,7 +1176,7 @@ fn parse_presence(data: &serde_json::Value, is_online: bool) -> Option<PollingEv
     )))
 }
 
-/// 从 JSON 数据中解析加密握手数据；peer_id_field 为对端用户 ID 所在字段名
+/// Parse encryption handshake data from JSON; peer_id_field names the field carrying the peer user id
 fn parse_handshake_data(
     data: &serde_json::Value,
     peer_id_field: &str,
@@ -1152,8 +1190,8 @@ fn parse_handshake_data(
     })
 }
 
-/// 从 JSON 数据中解析消息对象。content 为可选（加密房间的历史为 null），
-/// 与 HTTP DTO 一致按空串收下（界面对空正文补本地化的占位文案），绝不因单字段缺失丢弃整条消息
+/// Parse a message object from JSON. content is optional (null for encrypted-room history)
+/// and is accepted as an empty string exactly like the HTTP DTO (the interface fills an empty body with a localized placeholder); a missing field must never drop the whole message
 fn parse_message_info(data: &serde_json::Value) -> Option<MessageInfo> {
     Some(MessageInfo {
         id: data.get("id")?.as_str()?.to_string(),
@@ -1168,19 +1206,19 @@ fn parse_message_info(data: &serde_json::Value) -> Option<MessageInfo> {
     })
 }
 
-// ======================= WebSocket 线协议接缝（出站）=======================
-// 客户端→服务端的 WebSocket 上行报文（发送消息、加密握手各阶段）在此集中构造。
-// 领域命令 WsCommand 与线上 "type"/字段布局解耦；type 名称按 ApiVersion 匹配，
-// 未来某版本改线上名/字段只改本节的 outbound_type 与 outbound_ws_payload。
+// ======================= WebSocket wire protocol seam (outbound) =======================
+// All client-to-server WebSocket frames (message sends, every handshake stage) are built here, in one place.
+// The domain command WsCommand stays decoupled from the wire "type" and field layout; type names match on ApiVersion,
+// so a future rename only touches outbound_type and outbound_ws_payload in this section.
 
-/// 客户端→服务端上行命令（领域语义）。字段用引用借用，避免与调用方所有权纠缠。
+/// Client-to-server upstream commands (domain semantics). Fields borrow by reference to avoid ownership tangles with callers.
 pub enum WsCommand<'a> {
     SendMessage {
         room_id: &'a str,
         content: &'a str,
     },
-    /// 输入状态上报。服务端 typing 分支读取的是报文**顶层**的 room_id（不从 data 取），
-    /// 因此本命令的出站报文不带 data 包裹层，见 outbound_ws_payload 的说明
+    /// Typing report. The server's typing branch reads room_id from the **top level** of the frame (not from data),
+    /// so this command's outbound frame carries no data wrapper; see the note at outbound_ws_payload
     SendTyping {
         room_id: &'a str,
     },
@@ -1208,7 +1246,7 @@ pub enum WsCommand<'a> {
     },
 }
 
-/// 上行命令的逻辑类别，用于按版本查线上 type 字符串
+/// The logical class of an upstream command, used to look up the wire type string per version
 enum OutboundKind {
     SendMessage,
     SendTyping,
@@ -1220,8 +1258,8 @@ enum OutboundKind {
 }
 
 impl ApiVersion {
-    /// 该版本下某逻辑命令对应的线上 "type" 字符串。已知 0.1.3/0.1.4/未识别当前一致，
-    /// 显式列出以便将来对特定版本改名时只改此处。
+    /// The wire "type" string a logical command maps to on this version. The known 0.1.3/0.1.4/unrecognized cases currently agree,
+    /// but are listed explicitly so a future per-version rename only touches this spot.
     fn outbound_type(self, kind: OutboundKind) -> &'static str {
         match kind {
             OutboundKind::SendMessage => "send_message",
@@ -1235,15 +1273,15 @@ impl ApiVersion {
     }
 }
 
-/// 将领域上行命令序列化为服务端线上报文（type 名与 data 字段布局集中于接缝）
+/// Serialize a domain upstream command into the server wire frame (type names and data field layouts live in the seam)
 pub fn outbound_ws_payload(version: ApiVersion, command: WsCommand) -> serde_json::Value {
     match command {
         WsCommand::SendMessage { room_id, content } => serde_json::json!({
             "type": version.outbound_type(OutboundKind::SendMessage),
             "data": { "room_id": room_id, "content": content },
         }),
-        // typing 是唯一不带 data 包裹层的上行命令：服务端 handle_incoming 的 typing 分支
-        // 直接读报文顶层的 room_id，放进 data 会被判为缺字段而回 error
+        // typing is the only upstream command without a data wrapper: the server's handle_incoming typing branch
+        // reads room_id from the top level of the frame; wrapping it in data would be rejected as a missing field
         WsCommand::SendTyping { room_id } => serde_json::json!({
             "type": version.outbound_type(OutboundKind::SendTyping),
             "room_id": room_id,
@@ -1284,12 +1322,12 @@ pub fn outbound_ws_payload(version: ApiVersion, command: WsCommand) -> serde_jso
     }
 }
 
-// ==================== WebSocket 连接与保活线上常量（按版本）====================
-// HTTP↔WebSocket 地址映射、/websocket 路径、Bearer 头格式、应用层心跳帧、
-// 鉴权失败判定标记、心跳/订阅刷新/握手重发时序——全部集中于此，按 ApiVersion 匹配。
+// ==================== WebSocket connection and keep-alive wire constants (per version) ====================
+// HTTP-to-WebSocket address mapping, the /websocket path, the Bearer header format, the application heartbeat frame,
+// authentication-failure markers, and the heartbeat / subscription-refresh / handshake-retry timings — all here, matched on ApiVersion.
 impl ApiVersion {
-    /// 由 HTTP base_url 推导 WebSocket 连接地址（协议级 scheme 替换 + 固定路径）。
-    /// 路径 `/websocket` 是线上契约，未来版本改路径只改这里。
+    /// Derive the WebSocket address from the HTTP base_url (scheme replacement plus a fixed path).
+    /// The path `/websocket` is wire contract; a future change touches only this line.
     pub fn websocket_url(self, base_url: &str) -> String {
         let secured = base_url
             .replace("https://", "wss://")
@@ -1297,14 +1335,14 @@ impl ApiVersion {
         format!("{secured}/websocket")
     }
 
-    /// 应用层双向心跳帧。服务端对 "pong" 类型静默忽略（无回复），用于在客户端→服务端
-    /// 方向产生 TCP 流量，避免中间设备因单向静默判定连接死亡。
+    /// The application-level two-way heartbeat frame. The server silently ignores "pong" frames (no reply), keeping traffic flowing in the client-to-server
+    /// direction so middleboxes never declare the connection dead from one-way silence.
     pub fn heartbeat_frame(self) -> String {
         serde_json::json!({ "type": "pong" }).to_string()
     }
 
-    /// 服务端握手鉴权失败的特征串（HTTP 401/403 或令牌过期文案），用于令客户端清会话回登录页。
-    /// 小写匹配（调用方需先 lowercase 或此表均为小写片段，数字标记单独判）。
+    /// The signature strings of a server handshake authentication failure (HTTP 401/403 or expired-token texts), making the client drop its session and return to the login page.
+    /// Matched lowercase (callers lowercase first, or this table stays all-lowercase fragments; the numeric marker is judged separately).
     fn auth_failure_markers(self) -> &'static [&'static str] {
         &[
             "401",
@@ -1316,7 +1354,7 @@ impl ApiVersion {
         ]
     }
 
-    /// 判断一条 WebSocket 连接错误文本是否为服务端鉴权失败（应清除本地会话）
+    /// Decide whether a WebSocket connection error text is a server authentication failure (the local session should be cleared)
     pub fn is_auth_failure(self, error_text: &str) -> bool {
         let lowered = error_text.to_lowercase();
         self.auth_failure_markers()
@@ -1324,34 +1362,34 @@ impl ApiVersion {
             .any(|marker| lowered.contains(marker))
     }
 
-    /// 应用层心跳发送间隔（小于服务端 30 秒协议 Ping，保持双向流量）
+    /// Application heartbeat send interval (below the server's 30-second protocol Ping, keeping traffic two-way)
     pub fn application_heartbeat_interval(self) -> std::time::Duration {
         std::time::Duration::from_secs(20)
     }
 
-    /// 定期重建 WebSocket 以刷新房间订阅的间隔（服务端仅在连接时快照订阅）
+    /// Interval for rebuilding the WebSocket to refresh room subscriptions (the server only snapshots subscriptions at connect time)
     pub fn subscription_refresh_interval(self) -> std::time::Duration {
         std::time::Duration::from_secs(60)
     }
 
-    /// 未激活加密握手超时重发间隔
+    /// Retry interval for an encryption handshake that never activated
     pub fn handshake_resend_interval(self) -> std::time::Duration {
         std::time::Duration::from_secs(5)
     }
 
-    /// 输入状态上报的最小间隔。服务端对入站报文限流 30 条/30 秒，且 typing 只有"正在输入"
-    /// 一种帧，故按 1.5 秒节流：既小于接收端 2 秒衰减窗口（持续输入时指示不闪断），
-    /// 又给正常消息留出足够配额。
+    /// Minimum interval between typing reports. The server rate-limits inbound frames to 30 per 30 seconds, and typing has only the
+    /// "is typing" frame, so reports are throttled to 1.5 seconds: below the receiver's 2-second decay window (continuous typing keeps the indicator steady)
+    /// and with ample quota left for ordinary messages.
     pub fn typing_send_interval(self) -> std::time::Duration {
         std::time::Duration::from_millis(1500)
     }
 
-    /// 接收端判定"某成员已停止输入"的本地衰减窗口（TODO 约定：2 秒内视作处于打字状态）
+    /// The receiver's local decay window for deciding "a member stopped typing" (agreement: typing counts within the last 2 seconds)
     pub fn typing_display_window(self) -> std::time::Duration {
         std::time::Duration::from_secs(2)
     }
 
-    /// 服务端"会话结束" reason（线上串）对应的本地化文案键名，集中映射便于按版本调整
+    /// Map the server's "session ended" reason (wire string) onto a localized text key, kept central so versions can adjust it
     pub fn session_end_reason_key(self, reason: &str) -> &'static str {
         match reason {
             "user_left" => "notification_partner_ended_session",
@@ -1360,7 +1398,7 @@ impl ApiVersion {
         }
     }
 
-    /// 退房时服务器返回的"房间不存在/非成员"类错误是否属预期内（应静默忽略），串表按版本集中
+    /// Whether a "room not found / not a member" error from leaving is expected (silently ignored); the string table is central per version
     pub fn is_ignorable_room_removal_error(self, error_text: &str) -> bool {
         let lowered = error_text.to_lowercase();
         ["not found", "not exist", "not a member", "member"]
@@ -1369,34 +1407,34 @@ impl ApiVersion {
     }
 }
 
-/// 构造 HTTP/WebSocket 请求的 Authorization 头值（Bearer 方案，线上契约）
+/// Build the Authorization header value for HTTP/WebSocket requests (the Bearer scheme, wire contract)
 pub fn authorization_value(token: &str) -> String {
     format!("Bearer {token}")
 }
 
-/// WebSocket 认证失败的内部哨兵（客户端自造，非服务端线上串）。发送与匹配统一取自此处，
-/// 避免两端字面量漂移。
+/// The internal sentinel for a client-side WebSocket authentication failure (invented here, not a server wire string). Sender and matcher both take it from
+/// this one place so the two literals can never drift apart.
 pub fn websocket_auth_sentinel() -> &'static str {
     "WS_AUTH_FAILED"
 }
 
-/// 服务端运行时错误文本的领域归类。错误文案子串属线上契约，按版本集中判定；
-/// app.rs 只据归类决定行为，不再散落 contains 字面量。
+/// Domain classification of server runtime error texts. The substrings are wire contract, judged centrally per version;
+/// app.rs decides behavior from the class alone instead of scattering contains literals.
 pub enum ServerSignal {
-    /// 撞上服务器残留的活跃加密会话，需发 encrypt_leave 触发清理
+    /// Hit a stale active encryption session on the server; send encrypt_leave to trigger cleanup
     StuckEncryptedSession,
-    /// 对端离线导致握手被拒，需清理本地等待接受的僵死会话
+    /// The peer being offline made the handshake refuse; clear the local session stuck waiting for acceptance
     PartnerOfflineHandshakeRejected,
-    /// 无活跃加密会话（/quit 批量清理对无会话房间发 leave 属预期），静默忽略
+    /// No active encryption session (/quit batch cleanup may leave rooms that never had one; expected) — ignore silently
     NoActiveEncryptedSession,
-    /// 非该房间成员（私聊退房已先发 encrypt_leave，属预期），静默忽略
+    /// Not a member of the room (private-chat exit already sent encrypt_leave first; expected) — ignore silently
     NotRoomMember,
-    /// 其它真实错误，展示给用户
+    /// Any other real error; show it to the user
     Displayable,
 }
 
 impl ApiVersion {
-    /// 把服务端错误文本归类为领域信号（当前已知各版本文案一致，集中于此便于将来按版本分叉）
+    /// Classify a server error text into a domain signal (all known versions share the texts today; central for a future per-version fork)
     pub fn classify_server_error(self, error_text: &str) -> ServerSignal {
         let lowered = error_text.to_lowercase();
         if lowered.contains("already has an active encrypted session") {
@@ -1421,28 +1459,28 @@ mod tests {
     use tungstenite::Message as WebSocketMessage;
     use tungstenite::client::IntoClientRequest;
 
-    /// 注销账号后服务端会把 rooms.created_by 与 messages.sender_id 返回成 null
-    /// （两处外键都是 `ON DELETE SET NULL`）。这两个字段一旦按 String 解码，
-    /// 整份房间列表或整页历史会一起失败，所以必须在接缝里接住。
+    /// After an account is deleted the server returns rooms.created_by and messages.sender_id as null
+    /// (both foreign keys are `ON DELETE SET NULL`). Decoding these fields as String,
+    /// one failure would sink the whole room list or a whole history page, so the seam must catch them.
     #[test]
     fn null_user_references_still_decode_the_whole_payload() {
         let rooms: Vec<RoomInfo> = serde_json::from_str(
-            r#"[{"id":"room-1","name":null,"created_by":null,"created_at":"2026-09-05T00:00:00Z","is_group":true,"is_encrypted":false,"member_count":2,"role":"member","members":["user-a"]},{"id":"room-2","name":"群聊","created_at":"2026-09-05T00:00:00Z","is_group":true,"is_encrypted":false,"member_count":1,"role":"member","members":["user-a"]}]"#,
+            r#"[{"id":"room-1","name":null,"created_by":null,"created_at":"2026-09-05T00:00:00Z","is_group":true,"is_encrypted":false,"member_count":2,"role":"member","members":["user-a"]},{"id":"room-2","name":"team chat","created_at":"2026-09-05T00:00:00Z","is_group":true,"is_encrypted":false,"member_count":1,"role":"member","members":["user-a"]}]"#,
         )
-        .expect("created_by 为 null 或缺键都不该让房间列表解码失败");
+        .expect("neither a null nor a missing created_by may break the room list decode");
         assert_eq!(rooms.len(), 2);
         assert_eq!(rooms[0].created_by, "");
         assert_eq!(rooms[1].created_by, "");
 
         let history: MessagesData = serde_json::from_str(
-            r#"{"messages":[{"id":"msg-1","room_id":"room-1","sender_id":null,"content":"你好","created_at":"2026-09-05T00:00:00Z"},{"id":"msg-2","room_id":"room-1","sender_id":"user-a","content":null,"created_at":"2026-09-05T00:01:00Z"},{"id":"msg-3","room_id":"room-1","sender_id":"user-a","created_at":"2026-09-05T00:02:00Z"}],"has_more":false,"next_cursor":null}"#,
+            r#"{"messages":[{"id":"msg-1","room_id":"room-1","sender_id":null,"content":"hello","created_at":"2026-09-05T00:00:00Z"},{"id":"msg-2","room_id":"room-1","sender_id":"user-a","content":null,"created_at":"2026-09-05T00:01:00Z"},{"id":"msg-3","room_id":"room-1","sender_id":"user-a","created_at":"2026-09-05T00:02:00Z"}],"has_more":false,"next_cursor":null}"#,
         )
-        .expect("sender_id 与 content 为 null 都不该让整页消息解码失败");
+        .expect("null sender_id and null content must not break the whole message page decode");
         assert_eq!(history.messages.len(), 3);
         assert_eq!(history.messages[0].sender_id, "");
-        assert_eq!(history.messages[0].content, "你好");
-        // 加密房间的正文服务端给 null（密文存在 encrypted_content 里）：空内容是这个接缝的记号，
-        // 不是给用户看的文案，界面按自己的语言表补占位文字
+        assert_eq!(history.messages[0].content, "hello");
+        // In encrypted rooms the server gives null body (the ciphertext lives in encrypted_content): empty content is this seam's marker,
+        // not user-facing text; the interfaces fill in the placeholder from their own language tables
         assert_eq!(history.messages[1].content, "");
         assert_eq!(history.messages[2].content, "");
     }
@@ -1473,18 +1511,18 @@ mod tests {
     fn test_encode_query_component() {
         assert_eq!(encode_query_component("alice_01"), "alice_01");
         assert_eq!(encode_query_component("a b/c"), "a%20b%2Fc");
-        assert_eq!(encode_query_component("中文"), "%E4%B8%AD%E6%96%87");
+        assert_eq!(encode_query_component("héllo"), "h%C3%A9llo");
     }
 
-    /// 诊断用：双 WebSocket 连接完整模拟加密握手，逐环节打印事件类型，
-    /// 用于定位 encrypt_invitation / accept_response / session_ready 断点
+    /// For diagnostics: two WebSocket connections run a full encryption handshake, printing the event kind at every step,
+    /// to locate where encrypt_invitation / accept_response / session_ready breaks
     #[test]
     #[ignore]
     fn live_test_encrypted_handshake_flow() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        // —— 准备：注册两账号并建立加密私聊房间（复用请求流程）——
+        // -- preparation: register two accounts and open an encrypted private room (reusing the request flow) --
         let mut connector = Connector::new("http://localhost:2424");
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1512,7 +1550,7 @@ mod tests {
         let results = connector.search_users(&name_b).expect("search failed");
         let partner_id = results[0].id.clone();
         connector
-            .create_room_request(&partner_id, "握手诊断", true)
+            .create_room_request(&partner_id, "handshake diagnosis", true)
             .expect("create request failed");
         let login_b = connector
             .login(LoginRequest {
@@ -1529,7 +1567,7 @@ mod tests {
         let room_id = accepted.room.id.clone();
         println!("ROOM: {room_id}");
 
-        // —— 双连接建立 ——
+        // -- both connections established --
         let build_request = |token: &str| {
             let mut request = "ws://localhost:2424/websocket"
                 .to_string()
@@ -1552,7 +1590,7 @@ mod tests {
             let _ = stream.set_nonblocking(true);
         }
 
-        // 在时限内收集两端收到的事件类型序列
+        // Collect the sequence of event kinds each side receives within the time limit
         fn drain(
             socket: &mut tungstenite::WebSocket<
                 tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
@@ -1587,7 +1625,7 @@ mod tests {
             drain(&mut socket_b, 600)
         );
 
-        // A 发起 encrypt_request（占位密钥，仅验证服务器路由）
+        // A sends encrypt_request (placeholder keys; only verifying server routing)
         write_json(
             &mut socket_a,
             serde_json::json!({
@@ -1601,7 +1639,7 @@ mod tests {
             drain(&mut socket_b, 900)
         );
 
-        // B 回 accept + ready
+        // B answers accept + ready
         write_json(
             &mut socket_b,
             serde_json::json!({
@@ -1622,7 +1660,7 @@ mod tests {
             drain(&mut socket_b, 900)
         );
 
-        // A 回 ready → 双方就绪应触发 session_ready
+        // A answers ready -- both ready should trigger session_ready
         write_json(
             &mut socket_a,
             serde_json::json!({
@@ -1636,7 +1674,7 @@ mod tests {
             drain(&mut socket_b, 900)
         );
 
-        // A 发加密消息（占位密文）→ 双方都应收到 new_encrypted_message
+        // A sends an encrypted message (placeholder ciphertext) -- both sides should receive new_encrypted_message
         write_json(
             &mut socket_a,
             serde_json::json!({
@@ -1654,7 +1692,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_test_private_chat_flow() {
-        // 0.1.4 流程：搜索用户 → 发送聊天请求 → 对方接受 → 房间建立
+        // The 0.1.4 flow: search the user, send a chat request, the peer accepts, the room is created
         let mut connector = Connector::new("http://localhost:2424");
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1678,7 +1716,7 @@ mod tests {
             })
             .expect("register partner failed");
 
-        // 发起方登录（加密密码回传，验证确定性加密可登录）
+        // The initiator signs in (the encrypted password travels back, proving deterministic encryption can log in)
         let initiator_login = connector
             .login(LoginRequest {
                 username: initiator_name.clone(),
@@ -1686,7 +1724,7 @@ mod tests {
             })
             .expect("initiator login with encrypted password failed");
 
-        // 搜索对方拿到 user_id
+        // Search for the peer to obtain the user_id
         connector.set_token(&initiator_login.token);
         let search_results = connector
             .search_users(&partner_name)
@@ -1698,12 +1736,12 @@ mod tests {
             .id
             .clone();
 
-        // 发送聊天请求
+        // Send the chat request
         connector
-            .create_room_request(&partner_id, "建立私聊", false)
+            .create_room_request(&partner_id, "open a private chat", false)
             .expect("create room request failed");
 
-        // 对方登录后查看待处理请求并接受
+        // The peer signs in, reads the pending request and accepts it
         let partner_login = connector
             .login(LoginRequest {
                 username: partner_name.clone(),
@@ -1730,7 +1768,7 @@ mod tests {
             .expect("accept failed");
         assert!(!accepted.room.is_group);
 
-        // 双方房间列表都应出现该房间
+        // Both sides' room lists must now show the room
         let partner_rooms = connector.list_rooms().expect("partner list rooms failed");
         assert_eq!(partner_rooms.len(), 1);
         connector.set_token(&initiator_login.token);

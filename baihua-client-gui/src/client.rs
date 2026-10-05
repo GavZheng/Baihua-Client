@@ -1,17 +1,15 @@
-//! The session layer for the GUI: connections, rooms, messages, private chat requests, end-to-end encryption, account operations, and background thread driving.
-//!
-//! No egui types appear here: what the interface gets is data (room entries, message rows, four segments of status bar text, notification queue),
-//! the interface is only responsible for layout and mouse interaction. Protocol details all go through the one seam at `baihua_core::api`,
-//! theme and language reading goes through `baihua_core::config`, sharing the same config file as the TUI.
+//! The session layer: connections, rooms, messages, requests, encryption, account
+//! operations and background threads, with no egui type in sight.
 
 use baihua_core::config::{self, Language, Palette};
 use baihua_core::{
     api::{
-        Connector, MessageInfo, PollingEvent, PublicProfile, RoomInfo, RoomRequestInfo,
+        Connector, MessageInfo, PollingEvent, PublicProfile, RoomDetail, RoomInfo, RoomRequestInfo,
         UserSearchResult, authorization_value, parse_websocket_event, websocket_auth_sentinel,
     },
     chat_cache::ChatCache,
     crypto,
+    update::ReleasePackage,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -84,11 +82,76 @@ impl std::fmt::Debug for ClientCrypto {
     }
 }
 
-/// A notification: text, whether it is an error style, and expiration time. The interface draws it based on remaining time, and `tick` cleans it up when expired.
+/// Which built-in popup a notice line belongs to: same-kind lines share one
+/// popup, and the popup title text comes from the language table under `title_key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NoticeKind {
+    /// Ordinary hint popup (language key `notice_title_hint`)
+    Hint,
+    /// Failure popup (language key `notice_title_error`)
+    Error,
+    /// Incoming-message banner popup (language key `notice_title_new_message`)
+    NewMessage,
+}
+
+impl NoticeKind {
+    /// Every built-in kind, used by the expiry sweep and by popup ordering.
+    pub fn all() -> [NoticeKind; 3] {
+        [NoticeKind::Hint, NoticeKind::Error, NoticeKind::NewMessage]
+    }
+
+    /// Language key carrying this kind's popup title text.
+    pub fn title_key(self) -> &'static str {
+        match self {
+            NoticeKind::Hint => "notice_title_hint",
+            NoticeKind::Error => "notice_title_error",
+            NoticeKind::NewMessage => "notice_title_new_message",
+        }
+    }
+}
+
+/// A notice line inside the in-app popup stack; the interface draws it and
+/// `tick` sweeps it. Every field is transient display state, nothing persists.
 pub struct Notice {
+    /// Popup this line belongs to: decides title, colors and merging
+    pub kind: NoticeKind,
+    /// Body text of the line
     pub text: String,
-    pub is_error: bool,
+    /// Moment the line drops out of its popup (6 or 8 seconds after arrival)
     pub expires_at: Instant,
+    /// Moment the line arrived; the popup glide-in reads the earliest live one
+    pub shown_at: Instant,
+    /// Moment the whole popup started gliding out; none while the popup is open
+    pub closing_at: Option<Instant>,
+    /// Whether somebody already saw this line; unseen lines light the red dot
+    pub read: bool,
+    /// Whether the popup was tapped to keep its close button shown
+    pub pinned: bool,
+}
+
+/// A callback that asks the frame loop to run again; the interface builds it from
+/// `egui::Context::request_repaint` so the session layer never names egui.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// The sending half of the event channel, paired with the waker: pushing through
+/// it wakes the frame loop at once, so the loop no longer polls on a fixed beat.
+#[derive(Clone)]
+pub struct EventSink {
+    /// The raw channel end
+    sender: Sender<PollingEvent>,
+    /// Set once the interface has handed over its repaint callback
+    waker: Option<Waker>,
+}
+
+impl EventSink {
+    /// Publish one event and wake the frame loop so it is picked up at once.
+    pub fn send(&self, event: PollingEvent) {
+        if self.sender.send(event).is_ok()
+            && let Some(waker) = &self.waker
+        {
+            waker();
+        }
+    }
 }
 
 /// The session layer. Fields are split into two layers: the upper layer is user-controllable config (written to preferences.json), the lower layer is runtime state.
@@ -100,7 +163,7 @@ pub struct Client {
     pub language: Language,
     /// The currently active theme (the interface takes colors from here for rendering)
     pub palette: Palette,
-    /// Current theme name, "built_in" when no theme file
+    /// Current theme name; the default appearance name (`Palette::default_name`) when no theme file is chosen
     pub appearance_name: String,
     /// Whether to show the sender's UID in messages
     pub show_uid: bool,
@@ -145,6 +208,9 @@ pub struct Client {
     /// Index of the selected private chat request (received ones come first)
     /// Registered users directory cache; None means never fetched
     pub registered_users: Option<Vec<UserSearchResult>>,
+    /// Detail (with the authoritative member table) of the room the sidebar shows,
+    /// filled only on user actions so the render path never touches the network.
+    pub current_room_detail: Option<RoomDetail>,
     /// User ID → whether online. The server only broadcasts when the connection count changes from 0↔1; there is no baseline roster
     pub presence_by_user: HashMap<String, bool>,
     /// Members who are typing: room ID, username, most recent typing frame timestamp
@@ -161,10 +227,17 @@ pub struct Client {
     pub avatar_images: HashMap<String, Option<Vec<u8>>>,
     /// Encryption identity and per-room sessions
     pub crypto: ClientCrypto,
-    /// Event channel shared by background threads
-    pub events: Option<Sender<PollingEvent>>,
+    /// Event channel shared by the background threads; every send also wakes the
+    /// interface (see `set_event_waker`), so the frame loop need not poll.
+    pub events: Option<EventSink>,
     /// Event receiver end: the interface takes a batch of these events each frame before drawing
     event_receiver: Option<mpsc::Receiver<PollingEvent>>,
+    /// Callback that wakes the frame loop, kept so a channel opened before the
+    /// interface supplied one can still be rewired (see `set_event_waker`).
+    event_waker: Option<Waker>,
+    /// Receiver of the one-shot startup pass on a background thread: without it a
+    /// dead server blocked the first frame for the whole HTTP timeout.
+    startup_receiver: Option<mpsc::Receiver<StartupOutcome>>,
     /// WebSocket command channel (values are full JSON text)
     pub websocket_sender: Option<Sender<String>>,
     /// Token copy for reconnection use
@@ -176,6 +249,9 @@ pub struct Client {
     pub update_check_running: Option<Arc<AtomicBool>>,
     /// Search mode: keyword in the input box and match results (keyword, matched message IDs, current index)
     pub search_result: Option<(String, Vec<String>, usize)>,
+    /// What the search panel last committed with Enter: (keyword, matched IDs). Only
+    /// consulted while quick search is off, since that mode rescans as it draws.
+    pub panel_search_result: Option<(String, Vec<String>)>,
     /// Message ID to scroll to; cleared after the interface scrolls into position
     pub pending_scroll_message_id: Option<String>,
     /// Input box draft (bound directly by TextEdit in the GUI; the session layer needs to read it to determine search/command mode)
@@ -186,10 +262,8 @@ pub struct Client {
     pub left_room_ids: HashSet<String>,
     /// The moment the full room was loaded: discard late scroll events within a short time
     pub messages_reloaded_at: Instant,
-    /// Downloaded and verified update package (new version, package path)
-    pub pending_update: Option<(String, PathBuf)>,
-    /// Update has been handed off to a detached installer process; the interface should exit
-    pub update_handoff_requested: bool,
+    /// The update the feed offered and how far it has come (see `UpdateStage`)
+    pub pending_update: Option<(ReleasePackage, UpdateStage)>,
     /// The moment when message cache is pending being flushed to disk
     pub cache_pending_flush_since: Option<Instant>,
     /// Needs to exit after the main thread takes it away
@@ -203,10 +277,10 @@ impl Default for Client {
             connector,
             language: Language::default(),
             palette: Palette::built_in(),
-            appearance_name: "built_in".to_string(),
+            appearance_name: Palette::default_name().to_string(),
             show_uid: false,
             time_with_date: true,
-            sound_enabled: true,
+            sound_enabled: false,
             muted_room_ids: HashSet::new(),
             quick_search: false,
             rooms: Vec::new(),
@@ -225,6 +299,7 @@ impl Default for Client {
             pending_requests: Vec::new(),
             sent_requests: Vec::new(),
             registered_users: None,
+            current_room_detail: None,
             presence_by_user: HashMap::new(),
             typing_members: Vec::new(),
             last_typing_frame_sent_at: None,
@@ -235,6 +310,8 @@ impl Default for Client {
             crypto: ClientCrypto::default(),
             events: None,
             event_receiver: None,
+            event_waker: None,
+            startup_receiver: None,
             websocket_sender: None,
             websocket_token: None,
             websocket_running: None,
@@ -243,17 +320,37 @@ impl Default for Client {
             reachability_running: None,
             update_check_running: None,
             search_result: None,
+            panel_search_result: None,
             pending_scroll_message_id: None,
             draft: String::new(),
             closed_room_ids: HashSet::new(),
             left_room_ids: HashSet::new(),
             messages_reloaded_at: Instant::now(),
             pending_update: None,
-            update_handoff_requested: false,
             cache_pending_flush_since: None,
             quit_requested: false,
         }
     }
+}
+
+/// How far the offered update has come: asking the user, downloading after a yes, or
+/// holding the verified package ready to install.
+#[derive(Debug, Clone)]
+pub enum UpdateStage {
+    /// The prompt is on screen, nothing has been fetched yet
+    AwaitingAnswer,
+    /// The user agreed and the package is being downloaded on a background thread
+    Downloading,
+    /// The package arrived and passed its digest check; the path is the local file
+    Package(PathBuf),
+}
+pub struct StartupOutcome {
+    /// Whether the version probe reached the server at all
+    pub server_online: bool,
+    /// The probe verdict (wire version + raw greeting text), when it succeeded
+    pub probe: Option<(baihua_core::api::ApiVersion, String)>,
+    /// A saved session that the server accepted: (token, user id, rooms snapshot)
+    pub session: Option<(String, String, Vec<baihua_core::api::RoomInfo>)>,
 }
 
 impl Client {
@@ -274,19 +371,19 @@ impl Client {
             Ok(language) => client.language = language,
             // No language file could be read at startup: the text table itself is empty here, so every wording
             // (including this one) can only fall back to its key name until a readable file is installed.
-            Err(path) => client.notices.push(Notice {
-                text: format!(
+            Err(path) => client.push_notice(
+                NoticeKind::Error,
+                format!(
                     "{}: {}",
                     path.display(),
                     client.text("error_lang_file_read")
                 ),
-                is_error: true,
-                expires_at: Instant::now() + Duration::from_secs(6),
-            }),
+                6,
+            ),
         }
         client.show_uid = config::preference_bool("show_uid", false);
         client.time_with_date = config::preference_bool("time_with_date", true);
-        client.sound_enabled = config::preference_bool("sound_enabled", true);
+        client.sound_enabled = config::preference_bool("sound_enabled", false);
         client.quick_search = config::preference_bool("quick_search", false);
         client.muted_room_ids = preferences
             .get("muted_rooms")
@@ -310,22 +407,47 @@ impl Client {
         self.language.text(key)
     }
 
-    /// Add a notification (hint style)
-    pub fn notify(&mut self, text: String) {
+    /// Append one line to the popup of its kind: same-kind lines merge into one
+    /// popup, a fresh line inherits the popup's pinned state and cancels a glide-out.
+    fn push_notice(&mut self, kind: NoticeKind, text: String, hold_seconds: u64) {
+        let now = Instant::now();
+        let pinned = self
+            .notices
+            .iter()
+            .any(|notice| notice.kind == kind && notice.closing_at.is_none() && notice.pinned);
+        for notice in self.notices.iter_mut() {
+            if notice.kind == kind {
+                notice.closing_at = None;
+            }
+        }
         self.notices.push(Notice {
+            kind,
             text,
-            is_error: false,
-            expires_at: Instant::now() + Duration::from_secs(6),
+            expires_at: now + Duration::from_secs(hold_seconds),
+            shown_at: now,
+            closing_at: None,
+            read: false,
+            pinned,
         });
     }
 
-    /// Add a notification (error style)
+    /// Add a notification (hint popup)
+    pub fn notify(&mut self, text: String) {
+        self.push_notice(NoticeKind::Hint, text, 6);
+    }
+
+    /// Add a notification (error popup)
     pub fn notify_error(&mut self, text: String) {
-        self.notices.push(Notice {
-            text,
-            is_error: true,
-            expires_at: Instant::now() + Duration::from_secs(8),
-        });
+        self.push_notice(NoticeKind::Error, text, 8);
+    }
+
+    /// In-app banner for other people's messages: every platform shows it and it
+    /// ignores the system-notification switch (the phones' guaranteed notice).
+    pub fn notify_in_app(&mut self, title: &str, body: &str) {
+        if !crate::desktop_notice::in_app_ready() {
+            return;
+        }
+        self.push_notice(NoticeKind::NewMessage, format!("{title}: {body}"), 6);
     }
 
     // ==================== Configuration writeback ====================
@@ -345,7 +467,8 @@ impl Client {
         config::write_preferences(&[("language", Some(serde_json::json!(code)))]);
     }
 
-    /// Apply theme: read back the full color set at once; missing/extra fields are explicitly reported per the convention
+    /// Apply a theme: load the whole color set at once and report missing fields.
+    /// The retired reserved name `built_in` honestly reports "incomplete".
     pub fn apply_appearance(&mut self, name: &str) {
         let theme: baihua_core::config::ThemeFile = Palette::load(name);
         self.palette = theme.palette;
@@ -368,11 +491,11 @@ impl Client {
     /// User switches theme: apply and write back to config
     pub fn switch_appearance(&mut self, name: &str) {
         self.apply_appearance(name);
-        self.write_display_preferences();
+        self.save_preferences();
     }
 
     /// Write back all display-related config (new switches only change this one place)
-    pub fn write_display_preferences(&self) {
+    pub fn save_preferences(&self) {
         config::write_preferences(&[
             ("show_uid", Some(serde_json::json!(self.show_uid))),
             (
@@ -396,8 +519,8 @@ impl Client {
         self.connector.set_base_url(address);
         config::write_preferences(&[("server_address", Some(serde_json::json!(address)))]);
         self.connection_ready = None;
-        self.probe_server_at_startup();
-        self.start_reachability_watch();
+        self.probe_server();
+        self.watch_reachability();
         if self.is_signed_in() {
             self.start_polling();
         }
@@ -405,12 +528,8 @@ impl Client {
 
     // ==================== Session establishment ====================
 
-    /// The four segments for the top bar: connection label, marker, current user segment, version segment.
-    ///
-    /// The vertical bars are part of the **text**, exactly like the terminal version: the separator between the current user and
-    /// the connection state, and the one between the two version items, are both written into the segment.
-    /// The interface must not draw an extra separator of its own (a `Separator` inside a horizontal row of a top panel is as tall
-    /// as the whole panel area, which shows up as a stray vertical bar running down the window).
+    /// The four top-bar segments; the vertical bars belong in the texts, because a
+    /// drawn `Separator` would stretch the panel and show as a stray full-height bar.
     pub fn status_bar_texts(&self) -> (String, String, String, String) {
         let connection_label = self.text("bar_connection");
         let mark = match self.connection_ready {
@@ -450,19 +569,19 @@ impl Client {
     }
 
     /// Probe the server version (also determines the initial connection marker). Must probe even when not logged in, so the top bar can display the server version.
-    pub fn probe_server_at_startup(&mut self) {
+    pub fn probe_server(&mut self) {
         match self.connector.probe_version() {
-            Ok((_version, _text)) => self.update_connection_state(true),
+            Ok((_version, _text)) => self.update_connection(true),
             Err(error) => {
                 self.connector.clear_server_version();
-                config::debug_log(&format!("启动探测服务端失败: {error}"));
-                self.update_connection_state(false);
+                config::debug_log(&format!("Startup probe of the server failed: {error}"));
+                self.update_connection(false);
             }
         }
     }
 
     /// The single write entry for connection state: only notify once on a transition
-    pub fn update_connection_state(&mut self, online: bool) {
+    pub fn update_connection(&mut self, online: bool) {
         if self.connection_ready == Some(online) {
             return;
         }
@@ -479,7 +598,7 @@ impl Client {
 
     /// Persistent reachability probe: every 5 seconds, only judge offline after two consecutive failures.
     /// Only this place writes the connection marker; polling and WebSocket jitter must not flip it.
-    pub fn start_reachability_watch(&mut self) {
+    pub fn watch_reachability(&mut self) {
         if let Some(flag) = self.reachability_running.take() {
             flag.store(false, Ordering::Relaxed);
         }
@@ -494,11 +613,11 @@ impl Client {
             while flag.load(Ordering::Relaxed) {
                 if connector.probe_reachable() {
                     failures = 0;
-                    let _ = sender.send(PollingEvent::ReachabilityChanged(true));
+                    sender.send(PollingEvent::ReachabilityChanged(true))
                 } else {
                     failures += 1;
                     if failures >= 2 {
-                        let _ = sender.send(PollingEvent::ReachabilityChanged(false));
+                        sender.send(PollingEvent::ReachabilityChanged(false))
                     }
                 }
                 for _ in 0..50 {
@@ -511,14 +630,69 @@ impl Client {
         });
     }
 
-    /// Establish the event channel (only once); the interface uses `take_events` to take the receiver end
+    /// Start the one-shot startup pass on a background thread: probe the version,
+    /// then validate a saved session. The window paints before the answer arrives.
+    pub fn begin_startup(&mut self) {
+        let mut connector = self.connector.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.startup_receiver = Some(receiver);
+        thread::spawn(move || {
+            let probe = connector.probe_version().ok();
+            let server_online = probe.is_some();
+            let mut session = None;
+            if let Some((token, user_id)) = config::load_saved_session() {
+                let mut session_connector = connector.clone();
+                session_connector.set_token(&token);
+                match session_connector.list_rooms() {
+                    Ok(rooms) => session = Some((token, user_id, rooms)),
+                    Err(error) => {
+                        config::debug_log(&format!("Startup auto-login failed: {error}"));
+                        if server_online {
+                            // The server answered and rejected the token (or the
+                            // version made it unusable): the session is dead.
+                            config::clear_saved_session();
+                        }
+                    }
+                }
+            }
+            let outcome = StartupOutcome {
+                server_online,
+                probe,
+                session,
+            };
+            sender.send(outcome)
+        });
+    }
+
+    /// Take the startup outcome once the background pass has produced it.
+    pub fn take_startup_outcome(&mut self) -> Option<StartupOutcome> {
+        self.startup_receiver.as_ref()?.try_recv().ok()
+    }
+
     pub fn open_event_channel(&mut self) {
         if self.events.is_some() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.events = Some(sender);
+        self.events = Some(EventSink {
+            sender,
+            waker: self.event_waker.clone(),
+        });
         self.event_receiver = Some(receiver);
+    }
+
+    /// Hand the session layer the callback that wakes the frame loop, once, as a
+    /// closure around `egui::Context::request_repaint`.
+    pub fn set_event_waker(&mut self, waker: Waker) {
+        self.event_waker = Some(waker.clone());
+        if let Some(sink) = self.events.as_ref() {
+            // Re-open the already published sender with the waker attached.
+            let sender = sink.sender.clone();
+            self.events = Some(EventSink {
+                sender,
+                waker: Some(waker),
+            });
+        }
     }
 
     /// Take background events: the interface calls this once per frame
@@ -556,14 +730,16 @@ impl Client {
                         Ok(rooms) => {
                             if rooms != last_rooms {
                                 last_rooms = rooms.clone();
-                                let _ = sender.send(PollingEvent::RoomsUpdated(rooms));
+                                sender.send(PollingEvent::RoomsUpdated(rooms))
                             }
                         }
                         Err(error) if error.is_connection_failure() => {
-                            config::debug_log(&format!("轮询房间列表时连不上服务端: {error}"));
+                            config::debug_log(&format!(
+                                "Could not reach the server while polling the room list: {error}"
+                            ));
                         }
                         Err(error) => {
-                            let _ = sender.send(PollingEvent::Error(format!(
+                            sender.send(PollingEvent::Error(format!(
                                 "{}: {error}",
                                 translate("error_poll_rooms")
                             )));
@@ -575,12 +751,12 @@ impl Client {
                         Ok(requests) => {
                             if requests != last_received {
                                 last_received = requests.clone();
-                                let _ = sender.send(PollingEvent::PendingRequestsUpdated(requests));
+                                sender.send(PollingEvent::PendingRequestsUpdated(requests))
                             }
                         }
                         Err(error) => {
                             if !error.is_connection_failure() {
-                                let _ = sender.send(PollingEvent::Error(format!(
+                                sender.send(PollingEvent::Error(format!(
                                     "{}: {error}",
                                     translate("error_poll_requests")
                                 )));
@@ -591,12 +767,12 @@ impl Client {
                         Ok(requests) => {
                             if requests != last_sent {
                                 last_sent = requests.clone();
-                                let _ = sender.send(PollingEvent::SentRequestsUpdated(requests));
+                                sender.send(PollingEvent::SentRequestsUpdated(requests))
                             }
                         }
                         Err(error) => {
                             if !error.is_connection_failure() {
-                                let _ = sender.send(PollingEvent::Error(format!(
+                                sender.send(PollingEvent::Error(format!(
                                     "{}: {error}",
                                     translate("error_poll_requests")
                                 )));
@@ -645,8 +821,10 @@ impl Client {
                 let mut request = match url.as_str().into_client_request() {
                     Ok(request) => request,
                     Err(error) => {
-                        config::debug_log(&format!("WS 请求构造失败: {error}"));
-                        let _ = event_sender.send(PollingEvent::Error(format!(
+                        config::debug_log(&format!(
+                            "WebSocket request construction failed: {error}"
+                        ));
+                        event_sender.send(PollingEvent::Error(format!(
                             "{}: {error}",
                             translate("error_ws_handshake")
                         )));
@@ -664,7 +842,9 @@ impl Client {
                         request.headers_mut().insert("Authorization", value);
                     }
                     Err(error) => {
-                        config::debug_log(&format!("WS 认证头构造失败: {error}"));
+                        config::debug_log(&format!(
+                            "WebSocket authentication header construction failed: {error}"
+                        ));
                         for _ in 0..20 {
                             if !flag.load(Ordering::Relaxed) {
                                 return;
@@ -677,11 +857,11 @@ impl Client {
                 let mut socket = match tungstenite::connect(request) {
                     Ok((socket, _response)) => socket,
                     Err(error) => {
-                        let _ = event_sender.send(PollingEvent::WebSocketState(
+                        event_sender.send(PollingEvent::WebSocketState(
                             "error_ws_connect_failed".to_string(),
                         ));
                         if version.is_auth_failure(&error.to_string()) {
-                            let _ = event_sender
+                            event_sender
                                 .send(PollingEvent::Error(websocket_auth_sentinel().to_string()));
                             return;
                         }
@@ -710,18 +890,20 @@ impl Client {
                                     && let PollingEvent::WebSocketConnected = &event
                                     && let Some(sender) = ready.clone()
                                 {
+                                    // The plain `Sender<()>` handshake channel:
+                                    // its result is not interesting here.
                                     let _ = sender.send(());
                                     signaled = true;
                                 }
-                                let _ = event_sender.send(event);
+                                event_sender.send(event);
                             }
                         }
                         Ok(_) => {}
                         Err(tungstenite::Error::Io(error))
                             if error.kind() == ErrorKind::WouldBlock => {}
                         Err(error) => {
-                            config::debug_log(&format!("WS 断开: {error}"));
-                            let _ = event_sender.send(PollingEvent::WebSocketState(
+                            config::debug_log(&format!("WebSocket disconnected: {error}"));
+                            event_sender.send(PollingEvent::WebSocketState(
                                 "error_ws_disconnected_reconnect".to_string(),
                             ));
                             break;
@@ -729,7 +911,7 @@ impl Client {
                     }
                     while let Ok(payload) = command_receiver.try_recv() {
                         if socket.write(WebSocketMessage::text(payload)).is_err() {
-                            let _ = event_sender.send(PollingEvent::WebSocketState(
+                            event_sender.send(PollingEvent::WebSocketState(
                                 "error_ws_send_failed".to_string(),
                             ));
                         }
